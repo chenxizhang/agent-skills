@@ -150,12 +150,92 @@ print_info() {
 
 run_powershell() {
     if command -v pwsh &> /dev/null; then
-        pwsh -NoProfile -Command "$1" 2>/dev/null
+        pwsh -NoProfile -Command "$1" 2>/dev/null | tr -d '\r'
     elif command -v powershell.exe &> /dev/null; then
-        powershell.exe -NoProfile -Command "$1" 2>/dev/null
+        powershell.exe -NoProfile -Command "$1" 2>/dev/null | tr -d '\r'
     else
         echo "N/A"
     fi
+}
+
+# ============================================================================
+# Windows Data Collection (single PowerShell call for all checks)
+# ============================================================================
+
+declare -A WIN_DATA=()
+WIN_DATA_DISKS=""
+WIN_DATA_PROCS=""
+
+collect_windows_data() {
+    if [[ "$OS" != "windows" ]]; then
+        return 0
+    fi
+
+    local ps_file
+    ps_file=$(mktemp --suffix=.ps1)
+
+    # Always collect system info
+    cat > "$ps_file" << 'ENDPS'
+$ErrorActionPreference = "SilentlyContinue"
+Write-Output "OS_VERSION=$([System.Environment]::OSVersion.VersionString)"
+ENDPS
+
+    if $RUN_SECURITY; then
+        cat >> "$ps_file" << 'ENDPS'
+$fwCount = (Get-NetFirewallProfile -Profile Domain,Public,Private | Where-Object {$_.Enabled -eq $true}).Count
+Write-Output "FW_COUNT=$fwCount"
+$ports = (Get-NetTCPConnection -State Listen | Select-Object -ExpandProperty LocalPort | Sort-Object -Unique) -join " "
+Write-Output "LISTEN_PORTS=$ports"
+$mp = Get-MpComputerStatus
+Write-Output "DEFENDER_RTP=$($mp.RealTimeProtectionEnabled)"
+Write-Output "DEFENDER_SCAN=$($mp.FullScanEndTime)"
+try { $u = (New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher().Search("IsInstalled=0").Updates.Count; Write-Output "PENDING_UPDATES=$u" } catch { Write-Output "PENDING_UPDATES=N/A" }
+ENDPS
+    fi
+
+    if $RUN_PERFORMANCE; then
+        cat >> "$ps_file" << 'ENDPS'
+try { $cpu = [math]::Round((Get-Counter "\Processor(_Total)\% Processor Time").CounterSamples.CookedValue); Write-Output "CPU_USAGE=$cpu" } catch { Write-Output "CPU_USAGE=N/A" }
+$osInfo = Get-CimInstance Win32_OperatingSystem
+$memTotal = [math]::Round($osInfo.TotalVisibleMemorySize / 1MB, 1)
+$memFree = [math]::Round($osInfo.FreePhysicalMemory / 1MB, 1)
+$memUsed = [math]::Round($memTotal - $memFree, 1)
+$memPct = [math]::Round(($memUsed / $memTotal) * 100, 0)
+Write-Output "MEM_USED=$memUsed"
+Write-Output "MEM_TOTAL=$memTotal"
+Write-Output "MEM_PCT=$memPct"
+Get-PSDrive -PSProvider FileSystem | ForEach-Object { $t = [math]::Round($_.Used/1GB + $_.Free/1GB, 0); $u2 = [math]::Round($_.Used/1GB, 0); $p = if ($t -gt 0) { [math]::Round(($u2 / $t) * 100, 0) } else { 0 }; if ($t -gt 0) { Write-Output "DISK=$($_.Name):$u2`:$t`:$p" } }
+Get-Process | Sort-Object CPU -Descending | Select-Object -First 5 | ForEach-Object { $c = [math]::Round($_.CPU, 1); $m = [math]::Round($_.WorkingSet64/1MB, 0); Write-Output "PROC=$($_.ProcessName):${c}:${m}" }
+Write-Output "NET_ESTABLISHED=$((Get-NetTCPConnection -State Established).Count)"
+Write-Output "NET_LISTENING=$((Get-NetTCPConnection -State Listen).Count)"
+ENDPS
+    fi
+
+    if $RUN_OPTIMIZE; then
+        cat >> "$ps_file" << 'ENDPS'
+$tempSize = [math]::Round((Get-ChildItem -Path $env:TEMP -Recurse -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum / 1MB, 0)
+Write-Output "TEMP_SIZE=$tempSize"
+Write-Output "STARTUP_COUNT=$((Get-CimInstance Win32_StartupCommand).Count)"
+ENDPS
+    fi
+
+    local raw
+    if command -v pwsh &> /dev/null; then
+        raw=$(pwsh -NoProfile -ExecutionPolicy Bypass -File "$ps_file" 2>/dev/null | tr -d '\r')
+    elif command -v powershell.exe &> /dev/null; then
+        raw=$(powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$ps_file" 2>/dev/null | tr -d '\r')
+    fi
+    rm -f "$ps_file"
+
+    while IFS='=' read -r key value; do
+        [[ -z "$key" ]] && continue
+        case "$key" in
+            DISK) WIN_DATA_DISKS+="$value"$'\n' ;;
+            PROC) WIN_DATA_PROCS+="$value"$'\n' ;;
+            *) WIN_DATA["$key"]="$value" ;;
+        esac
+    done <<< "$raw"
+    return 0
 }
 
 # ============================================================================
@@ -170,9 +250,7 @@ print_system_info() {
 
     case $OS in
         windows)
-            local win_ver
-            win_ver=$(run_powershell '[System.Environment]::OSVersion.VersionString')
-            echo "System: Windows - $win_ver"
+            echo "System: Windows - ${WIN_DATA[OS_VERSION]}"
             ;;
         macos)
             echo "System: macOS $(sw_vers -productVersion)"
@@ -198,8 +276,7 @@ check_firewall() {
 
     case $OS in
         windows)
-            local fw_status
-            fw_status=$(run_powershell '(Get-NetFirewallProfile -Profile Domain,Public,Private | Where-Object {$_.Enabled -eq $true}).Count')
+            local fw_status="${WIN_DATA[FW_COUNT]}"
             if [[ "$fw_status" -ge 1 ]]; then
                 print_ok "Firewall: Enabled ($fw_status profile(s) active)"
             else
@@ -251,7 +328,7 @@ check_open_ports() {
 
     case $OS in
         windows)
-            ports=$(run_powershell 'Get-NetTCPConnection -State Listen | Select-Object -ExpandProperty LocalPort | Sort-Object -Unique | ForEach-Object { $_ }' | tr '\n' ' ')
+            ports="${WIN_DATA[LISTEN_PORTS]}"
             ;;
         macos|linux)
             if command -v ss &> /dev/null; then
@@ -324,17 +401,14 @@ check_antivirus() {
 
     case $OS in
         windows)
-            local defender_status
-            defender_status=$(run_powershell '(Get-MpComputerStatus).RealTimeProtectionEnabled')
+            local defender_status="${WIN_DATA[DEFENDER_RTP]}"
             if [[ "$defender_status" == "True" ]]; then
                 print_ok "Windows Defender: Real-time protection enabled"
             else
                 print_fail "Windows Defender: Real-time protection disabled" "Enable real-time protection in Windows Security"
             fi
 
-            local last_scan
-            last_scan=$(run_powershell '(Get-MpComputerStatus).FullScanEndTime')
-            print_info "Last full scan: $last_scan"
+            print_info "Last full scan: ${WIN_DATA[DEFENDER_SCAN]}"
             ;;
         macos)
             if [[ -d "/Library/Apple/System/Library/CoreServices/XProtect.app" ]]; then
@@ -356,8 +430,7 @@ check_updates() {
 
     case $OS in
         windows)
-            local pending
-            pending=$(run_powershell '(New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher().Search("IsInstalled=0").Updates.Count' 2>/dev/null || echo "N/A")
+            local pending="${WIN_DATA[PENDING_UPDATES]}"
             if [[ "$pending" == "0" ]]; then
                 print_ok "Windows Update: System is up to date"
             elif [[ "$pending" == "N/A" ]]; then
@@ -433,6 +506,342 @@ check_sensitive_files() {
     esac
 }
 
+# ============================================================================
+# AI Agent Security Analysis
+# ============================================================================
+
+# Counters for summary
+AGENT_SCAN_AGENTS=0
+AGENT_SCAN_SCRIPTS=0
+AGENT_SCAN_CONFIGS=0
+AGENT_SCAN_HIGH=0
+AGENT_SCAN_MEDIUM=0
+AGENT_SCAN_LOW=0
+
+# Global arrays for discovered agents (using | as delimiter for name|path)
+declare -a GLOBAL_AGENTS=()
+declare -a PROJECT_AGENTS=()
+
+# Discover installed AI agents by checking for their directories
+discover_ai_agents() {
+    GLOBAL_AGENTS=()
+
+    # Global configurations
+    [[ -d "$HOME/.claude" ]] && GLOBAL_AGENTS+=("Claude_Code|$HOME/.claude")
+    [[ -d "$HOME/.copilot" ]] && GLOBAL_AGENTS+=("GitHub_Copilot|$HOME/.copilot")
+    [[ -d "$HOME/.continue" ]] && GLOBAL_AGENTS+=("Continue.dev|$HOME/.continue")
+    [[ -d "$HOME/.cursor" ]] && GLOBAL_AGENTS+=("Cursor|$HOME/.cursor")
+    [[ -d "$HOME/.aider" ]] && GLOBAL_AGENTS+=("Aider|$HOME/.aider")
+    [[ -d "$HOME/.agents" ]] && GLOBAL_AGENTS+=("Skills_CLI|$HOME/.agents")
+    [[ -d "$HOME/.codeium" ]] && GLOBAL_AGENTS+=("Codeium|$HOME/.codeium")
+    [[ -d "$HOME/.codeflow" ]] && GLOBAL_AGENTS+=("Windsurf|$HOME/.codeflow")
+    return 0
+}
+
+# Discover project-level agent configurations
+discover_project_agents() {
+    PROJECT_AGENTS=()
+    local cwd="${PWD}"
+
+    [[ -d "$cwd/.claude" ]] && PROJECT_AGENTS+=("Claude_Code|$cwd/.claude")
+    [[ -d "$cwd/.continue" ]] && PROJECT_AGENTS+=("Continue.dev|$cwd/.continue")
+    [[ -d "$cwd/.cursor" ]] && PROJECT_AGENTS+=("Cursor|$cwd/.cursor")
+    [[ -d "$cwd/.copilot" ]] && PROJECT_AGENTS+=("Copilot|$cwd/.copilot")
+    [[ -d "$cwd/.github/copilot" ]] && PROJECT_AGENTS+=("GitHub_Copilot|$cwd/.github/copilot")
+    return 0
+}
+
+# Analyze a script file for security risks
+# Returns: risk findings as newline-separated strings
+analyze_script_file() {
+    local file="$1"
+    local findings=()
+
+    # Read file content (limit to first 5000 chars for performance)
+    local content
+    content=$(head -c 5000 "$file" 2>/dev/null) || return
+
+    # HIGH: Network outbound with data
+    if echo "$content" | grep -qiE 'curl.*(-X\s*POST|--data|--upload|-d\s)'; then
+        findings+=("HIGH:Network POST request detected (curl with data)")
+    fi
+    if echo "$content" | grep -qiE 'wget.*--post'; then
+        findings+=("HIGH:Network POST request detected (wget)")
+    fi
+    if echo "$content" | grep -qiE 'Invoke-WebRequest.*-Method\s*(Post|Put)'; then
+        findings+=("HIGH:Network POST request detected (PowerShell)")
+    fi
+    if echo "$content" | grep -qiE 'fetch\s*\([^)]*method[^)]*POST'; then
+        findings+=("HIGH:Network POST request detected (fetch)")
+    fi
+
+    # HIGH: Credential/secret access
+    if echo "$content" | grep -qiE '(cat|type|less|more|head|tail).*\.(ssh|aws|gnupg|netrc)'; then
+        findings+=("HIGH:Reading credential files detected")
+    fi
+    if echo "$content" | grep -qiE '\$\{?(AWS_SECRET|API_KEY|GITHUB_TOKEN|NPM_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY)'; then
+        findings+=("HIGH:Accessing sensitive environment variables")
+    fi
+
+    # HIGH: Obfuscation patterns
+    if echo "$content" | grep -qiE 'base64\s+(-d|--decode)|base64\s+-D'; then
+        findings+=("HIGH:Base64 decoding detected (possible obfuscation)")
+    fi
+    if echo "$content" | grep -qiE 'xxd\s+-r|printf.*\\x[0-9a-f]{2}'; then
+        findings+=("HIGH:Hex decoding detected (possible obfuscation)")
+    fi
+    if echo "$content" | grep -qiE '\$\(echo.*\|.*rev\)|\$\(rev\s*<<<'; then
+        findings+=("HIGH:String reversal detected (possible obfuscation)")
+    fi
+
+    # MEDIUM: Dynamic execution
+    if echo "$content" | grep -qiE '\beval\s+["$]|\beval\s*\('; then
+        findings+=("MEDIUM:Dynamic eval execution")
+    fi
+    if echo "$content" | grep -qiE 'source\s+<\(|source\s+/dev/stdin'; then
+        findings+=("MEDIUM:Dynamic source execution")
+    fi
+    if echo "$content" | grep -qiE '\bexec\s+["`$]'; then
+        findings+=("MEDIUM:Dynamic exec execution")
+    fi
+
+    # MEDIUM: External package installation
+    if echo "$content" | grep -qiE 'npx\s+-y\s|npm\s+install\s|pip\s+install\s|gem\s+install'; then
+        findings+=("MEDIUM:External package installation detected")
+    fi
+
+    # LOW: Network requests (without POST)
+    if echo "$content" | grep -qiE '\bcurl\b|\bwget\b' && ! echo "$content" | grep -qiE 'curl.*(-X\s*POST|--data|-d\s)'; then
+        findings+=("LOW:Network requests detected (review URLs)")
+    fi
+
+    # Output findings
+    for finding in "${findings[@]}"; do
+        echo "$finding"
+    done
+}
+
+# Analyze a config file for security risks
+analyze_config_file() {
+    local file="$1"
+    local findings=()
+
+    # Read file content
+    local content
+    content=$(head -c 10000 "$file" 2>/dev/null) || return
+
+    # Check for dangerous permission settings
+    if echo "$content" | grep -qiE '"bypassPermissions"\s*:\s*true|"skipVerify"\s*:\s*true'; then
+        findings+=("MEDIUM:Dangerous permission bypass enabled")
+    fi
+
+    # Check for MCP server definitions with external commands
+    if echo "$content" | grep -qiE '"mcpServers"\s*:' && echo "$content" | grep -qiE '"command"\s*:'; then
+        findings+=("LOW:MCP servers configured (review commands)")
+    fi
+
+    # Check for external URLs
+    if echo "$content" | grep -qiE '"(url|endpoint|server|host)"\s*:\s*"https?://'; then
+        findings+=("LOW:External URLs configured (review endpoints)")
+    fi
+
+    # Check for embedded commands in hooks
+    if echo "$content" | grep -qiE '"hooks"\s*:' && echo "$content" | grep -qiE '"command"\s*:'; then
+        findings+=("LOW:Hooks with commands configured (review)")
+    fi
+
+    # Check for API keys in config (should be in env vars)
+    if echo "$content" | grep -qiE '"(api_key|apiKey|api-key|token|secret)"\s*:\s*"[^"]{10,}"'; then
+        findings+=("MEDIUM:API key or secret in config file")
+    fi
+
+    # Output findings
+    for finding in "${findings[@]}"; do
+        echo "$finding"
+    done
+}
+
+# Scan an agent directory for security issues
+scan_agent_directory() {
+    local agent_name="$1"
+    local agent_dir="$2"
+    local scope="$3"  # "Global" or "Project"
+
+    echo ""
+    echo "[$agent_name - $scope]"
+    echo "────────────────────────────────────────"
+
+    AGENT_SCAN_AGENTS=$((AGENT_SCAN_AGENTS + 1))
+
+    local has_issues=false
+    local script_count=0
+    local config_count=0
+    declare -a script_issues=()
+    declare -a config_issues=()
+
+    # Find script files (limit depth to 3 for performance)
+    local tmpfile
+    tmpfile=$(mktemp)
+    find "$agent_dir" -maxdepth 3 -type f \( -name "*.sh" -o -name "*.py" -o -name "*.js" -o -name "*.ts" -o -name "*.ps1" \) 2>/dev/null > "$tmpfile" || true
+
+    while IFS= read -r script; do
+        [[ -z "$script" ]] && continue
+        [[ ! -f "$script" ]] && continue
+        script_count=$((script_count + 1))
+        AGENT_SCAN_SCRIPTS=$((AGENT_SCAN_SCRIPTS + 1))
+
+        local findings
+        findings=$(analyze_script_file "$script" 2>/dev/null) || true
+        if [[ -n "$findings" ]]; then
+            local rel_path="${script#"$agent_dir/"}"
+            while IFS= read -r finding; do
+                [[ -z "$finding" ]] && continue
+                local level="${finding%%:*}"
+                local msg="${finding#*:}"
+                script_issues+=("$rel_path: $msg")
+
+                case "$level" in
+                    HIGH) AGENT_SCAN_HIGH=$((AGENT_SCAN_HIGH + 1)) ;;
+                    MEDIUM) AGENT_SCAN_MEDIUM=$((AGENT_SCAN_MEDIUM + 1)) ;;
+                    LOW) AGENT_SCAN_LOW=$((AGENT_SCAN_LOW + 1)) ;;
+                esac
+            done <<< "$findings"
+        fi
+    done < "$tmpfile"
+    rm -f "$tmpfile"
+
+    if [[ ${#script_issues[@]} -gt 0 ]]; then
+        has_issues=true
+        print_warn "scripts ($script_count files analyzed)"
+        for issue in "${script_issues[@]}"; do
+            echo "    └─ $issue"
+        done
+    elif [[ $script_count -gt 0 ]]; then
+        print_ok "scripts ($script_count files): No issues found"
+    fi
+
+    # Find config files (limit depth to 2)
+    tmpfile=$(mktemp)
+    find "$agent_dir" -maxdepth 2 -type f \( -name "*.json" -o -name "*.yaml" -o -name "*.yml" -o -name "*.toml" \) 2>/dev/null > "$tmpfile" || true
+
+    while IFS= read -r config; do
+        [[ -z "$config" ]] && continue
+        [[ ! -f "$config" ]] && continue
+        config_count=$((config_count + 1))
+        AGENT_SCAN_CONFIGS=$((AGENT_SCAN_CONFIGS + 1))
+
+        local findings
+        findings=$(analyze_config_file "$config" 2>/dev/null) || true
+        if [[ -n "$findings" ]]; then
+            local rel_path="${config#"$agent_dir/"}"
+            while IFS= read -r finding; do
+                [[ -z "$finding" ]] && continue
+                local level="${finding%%:*}"
+                local msg="${finding#*:}"
+                config_issues+=("$rel_path: $msg")
+
+                case "$level" in
+                    HIGH) AGENT_SCAN_HIGH=$((AGENT_SCAN_HIGH + 1)) ;;
+                    MEDIUM) AGENT_SCAN_MEDIUM=$((AGENT_SCAN_MEDIUM + 1)) ;;
+                    LOW) AGENT_SCAN_LOW=$((AGENT_SCAN_LOW + 1)) ;;
+                esac
+            done <<< "$findings"
+        fi
+    done < "$tmpfile"
+    rm -f "$tmpfile"
+
+    if [[ ${#config_issues[@]} -gt 0 ]]; then
+        has_issues=true
+        print_warn "configs ($config_count files analyzed)"
+        for issue in "${config_issues[@]}"; do
+            echo "    └─ $issue"
+        done
+    elif [[ $config_count -gt 0 ]]; then
+        print_ok "configs ($config_count files): No issues found"
+    fi
+
+    # Summary for this agent
+    if ! $has_issues && [[ $script_count -eq 0 ]] && [[ $config_count -eq 0 ]]; then
+        print_ok "No executable scripts or configs found"
+    fi
+}
+
+# Main orchestrator for AI agent security checks
+run_agent_security_checks() {
+    print_header "AI AGENT SECURITY ANALYSIS"
+
+    # Reset counters
+    AGENT_SCAN_AGENTS=0
+    AGENT_SCAN_SCRIPTS=0
+    AGENT_SCAN_CONFIGS=0
+    AGENT_SCAN_HIGH=0
+    AGENT_SCAN_MEDIUM=0
+    AGENT_SCAN_LOW=0
+
+    # Discover installed agents
+    discover_ai_agents
+
+    # Check if any global agents found
+    local agent_count=${#GLOBAL_AGENTS[@]}
+    if [[ $agent_count -eq 0 ]]; then
+        print_info "No AI agents detected in home directory"
+    else
+        echo ""
+        echo "Discovered AI Agents:"
+        for agent_info in "${GLOBAL_AGENTS[@]}"; do
+            local name="${agent_info%%|*}"
+            local path="${agent_info#*|}"
+            # Replace underscores with spaces for display
+            local display_name="${name//_/ }"
+            # Shorten home path for display
+            local display_path="${path/$HOME/~}"
+            echo "  • $display_name ($display_path)"
+        done
+
+        # Scan each global agent
+        for agent_info in "${GLOBAL_AGENTS[@]}"; do
+            local name="${agent_info%%|*}"
+            local path="${agent_info#*|}"
+            local display_name="${name//_/ }"
+            scan_agent_directory "$display_name" "$path" "Global"
+        done
+    fi
+
+    # Scan project-level configs
+    discover_project_agents
+
+    echo ""
+    echo "[Project Level: ${PWD}]"
+    echo "────────────────────────────────────────"
+
+    # Check if any project agents found
+    if [[ ${#PROJECT_AGENTS[@]} -eq 0 ]]; then
+        print_info "No project-level agent configs found"
+    else
+        for agent_info in "${PROJECT_AGENTS[@]}"; do
+            local name="${agent_info%%|*}"
+            local path="${agent_info#*|}"
+            local display_name="${name//_/ }"
+            scan_agent_directory "$display_name" "$path" "Project"
+        done
+    fi
+
+    # Print summary
+    echo ""
+    echo "Summary"
+    echo "────────────────────────────────────────"
+    echo "Agents scanned: $AGENT_SCAN_AGENTS"
+    echo "Scripts analyzed: $AGENT_SCAN_SCRIPTS"
+    echo "Configs analyzed: $AGENT_SCAN_CONFIGS"
+
+    local total_issues=$((AGENT_SCAN_HIGH + AGENT_SCAN_MEDIUM + AGENT_SCAN_LOW))
+    if [[ $total_issues -eq 0 ]]; then
+        print_ok "No security issues found"
+    else
+        print_warn "Issues found: $total_issues ($AGENT_SCAN_HIGH HIGH, $AGENT_SCAN_MEDIUM MEDIUM, $AGENT_SCAN_LOW LOW)"
+    fi
+}
+
 run_security_checks() {
     print_header "SECURITY ANALYSIS"
 
@@ -442,6 +851,9 @@ run_security_checks() {
     check_antivirus
     check_updates
     check_sensitive_files
+
+    # AI Agent security analysis
+    run_agent_security_checks
 }
 
 # ============================================================================
@@ -453,8 +865,7 @@ check_cpu() {
 
     case $OS in
         windows)
-            local cpu_usage
-            cpu_usage=$(run_powershell '(Get-Counter "\Processor(_Total)\% Processor Time").CounterSamples.CookedValue' | cut -d. -f1)
+            local cpu_usage="${WIN_DATA[CPU_USAGE]}"
             if [[ -n "$cpu_usage" ]] && [[ "$cpu_usage" =~ ^[0-9]+$ ]]; then
                 if [[ "$cpu_usage" -lt 70 ]]; then
                     print_ok "CPU Usage: ${cpu_usage}%"
@@ -492,16 +903,9 @@ check_memory() {
 
     case $OS in
         windows)
-            local mem_info
-            mem_info=$(run_powershell '
-                $os = Get-CimInstance Win32_OperatingSystem
-                $total = [math]::Round($os.TotalVisibleMemorySize / 1MB, 1)
-                $free = [math]::Round($os.FreePhysicalMemory / 1MB, 1)
-                $used = [math]::Round($total - $free, 1)
-                $pct = [math]::Round(($used / $total) * 100, 0)
-                Write-Output "$used|$total|$pct"
-            ')
-            IFS='|' read -r used total pct <<< "$mem_info"
+            local used="${WIN_DATA[MEM_USED]}"
+            local total="${WIN_DATA[MEM_TOTAL]}"
+            local pct="${WIN_DATA[MEM_PCT]}"
             if [[ "$pct" -lt 80 ]]; then
                 print_ok "Memory: ${used}GB / ${total}GB (${pct}%)"
             else
@@ -542,28 +946,19 @@ check_disk() {
 
     case $OS in
         windows)
-            run_powershell '
-                Get-PSDrive -PSProvider FileSystem | ForEach-Object {
-                    $total = [math]::Round($_.Used/1GB + $_.Free/1GB, 0)
-                    $used = [math]::Round($_.Used/1GB, 0)
-                    $pct = if ($total -gt 0) { [math]::Round(($used / $total) * 100, 0) } else { 0 }
-                    Write-Output "$($_.Name):|$used|$total|$pct"
-                }
-            ' | tr -d '\r' | while IFS='|' read -r drive used total pct; do
-                # Clean up variables
-                pct=$(echo "$pct" | tr -cd '0-9')
-                total=$(echo "$total" | tr -cd '0-9')
-                if [[ -n "$drive" ]] && [[ -n "$total" ]] && [[ "$total" -gt 0 ]]; then
+            while IFS=':' read -r drive used total pct; do
+                [[ -z "$drive" ]] && continue
+                if [[ -n "$total" ]] && [[ "$total" -gt 0 ]]; then
                     if [[ -z "$pct" ]]; then pct=0; fi
                     if [[ "$pct" -lt 80 ]]; then
-                        print_ok "Disk $drive ${used}GB / ${total}GB (${pct}%)"
+                        print_ok "Disk $drive: ${used}GB / ${total}GB (${pct}%)"
                     elif [[ "$pct" -lt 90 ]]; then
-                        print_warn "Disk $drive ${used}GB / ${total}GB (${pct}%)" "Consider cleanup"
+                        print_warn "Disk $drive: ${used}GB / ${total}GB (${pct}%)" "Consider cleanup"
                     else
-                        print_fail "Disk $drive ${used}GB / ${total}GB (${pct}%)" "Critical - free up space"
+                        print_fail "Disk $drive: ${used}GB / ${total}GB (${pct}%)" "Critical - free up space"
                     fi
                 fi
-            done
+            done <<< "$WIN_DATA_DISKS"
             ;;
         macos|linux)
             df -h 2>/dev/null | awk 'NR>1 && /^\/dev/ {
@@ -589,14 +984,10 @@ check_top_processes() {
     echo ""
     case $OS in
         windows)
-            run_powershell '
-                Get-Process | Sort-Object CPU -Descending | Select-Object -First 5 |
-                ForEach-Object {
-                    $cpu = [math]::Round($_.CPU, 1)
-                    $mem = [math]::Round($_.WorkingSet64/1MB, 0)
-                    Write-Output ("  {0,-30} CPU: {1,8}s  Mem: {2,6}MB" -f $_.ProcessName, $cpu, $mem)
-                }
-            '
+            while IFS=':' read -r name cpu mem; do
+                [[ -z "$name" ]] && continue
+                printf "  %-30s CPU: %8ss  Mem: %6sMB\n" "$name" "$cpu" "$mem"
+            done <<< "$WIN_DATA_PROCS"
             ;;
         macos)
             ps aux | sort -nrk 3 | head -5 | awk '{printf "  %-30s CPU: %5s%%  Mem: %5s%%\n", $11, $3, $4}'
@@ -615,8 +1006,8 @@ check_network_connections() {
 
     case $OS in
         windows)
-            established=$(run_powershell '(Get-NetTCPConnection -State Established).Count')
-            listening=$(run_powershell '(Get-NetTCPConnection -State Listen).Count')
+            established="${WIN_DATA[NET_ESTABLISHED]}"
+            listening="${WIN_DATA[NET_LISTENING]}"
             ;;
         macos|linux)
             if command -v ss &> /dev/null; then
@@ -653,11 +1044,7 @@ check_temp_files() {
 
     case $OS in
         windows)
-            temp_size=$(run_powershell '
-                $size = (Get-ChildItem -Path $env:TEMP -Recurse -ErrorAction SilentlyContinue |
-                    Measure-Object -Property Length -Sum).Sum / 1MB
-                [math]::Round($size, 0)
-            ')
+            temp_size="${WIN_DATA[TEMP_SIZE]}"
             if [[ -n "$temp_size" ]] && [[ "$temp_size" -gt 500 ]]; then
                 print_warn "Temp files: ${temp_size}MB in %TEMP%" "Consider running disk cleanup"
             else
@@ -752,9 +1139,7 @@ check_startup_items() {
 
     case $OS in
         windows)
-            local count
-            count=$(run_powershell '(Get-CimInstance Win32_StartupCommand).Count')
-            print_info "Startup items: $count registered"
+            print_info "Startup items: ${WIN_DATA[STARTUP_COUNT]} registered"
             ;;
         macos)
             local launch_agents
@@ -789,6 +1174,9 @@ main() {
     if [[ -n "$OUTPUT_FILE" ]]; then
         exec > "$OUTPUT_FILE"
     fi
+
+    # Collect all Windows data in a single PowerShell call
+    collect_windows_data
 
     print_header "SYSTEM HEALTH CHECK REPORT"
     print_system_info

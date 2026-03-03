@@ -63,6 +63,37 @@ bash scripts/check.sh --json --output report.json
 | Sensitive file permissions | ✓ | ✓ | ✓ |
 | Antivirus status | ✓ | ✓ | - |
 | System updates | ✓ | ✓ | ✓ |
+| AI Agent security | ✓ | ✓ | ✓ |
+
+### AI Agent Security
+
+Automatically discovers and scans AI agent configurations for potential security risks:
+
+**Supported Agents:**
+- Claude Code (`~/.claude/`)
+- GitHub Copilot (`~/.copilot/`)
+- Continue.dev (`~/.continue/`)
+- Cursor (`~/.cursor/`)
+- Aider (`~/.aider/`)
+- Skills CLI (`~/.agents/`)
+- Codeium (`~/.codeium/`)
+- Windsurf/Codeflow (`~/.codeflow/`)
+
+**Project-level configs also scanned:**
+- `.claude/`, `.continue/`, `.cursor/`, `.copilot/`, `.github/copilot/`
+
+**Security Risk Categories:**
+
+| Category | Risk Level | Example Patterns |
+|----------|------------|------------------|
+| Network outbound | HIGH | `curl POST`, `wget --post`, `Invoke-WebRequest` |
+| Credential access | HIGH | Reading `.ssh/`, `.aws/`, accessing `API_KEY` vars |
+| Obfuscation | HIGH | `base64 -d`, hex decoding, string reversal |
+| Dynamic execution | MEDIUM | `eval`, `exec`, `source <(...)` |
+| Package installation | MEDIUM | `npx -y`, `pip install`, `npm install` |
+| Permission bypass | MEDIUM | `bypassPermissions`, `skipVerify` |
+| Network requests | LOW | General `curl`/`wget` usage |
+| MCP servers | LOW | MCP server definitions with commands |
 
 ### Performance
 
