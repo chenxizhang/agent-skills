@@ -4,7 +4,7 @@ description: Recursively find all git repositories and pull latest changes from 
 license: MIT
 metadata:
   author: chenxizhang
-  version: "2.0"
+  version: "3.0"
 ---
 
 # Git Sync All
@@ -17,53 +17,103 @@ Synchronize all git repositories under the current working directory by pulling 
 - When you need to update multiple projects at once
 - To ensure all local repositories are up to date with remotes
 
-## Execution Strategy
+## Strict Execution Flow
 
-**Do NOT use any scripts. Execute all commands directly through the agent's shell/tool capabilities.**
+**Do NOT use any scripts. Do NOT skip or merge phases. Execute each phase in order.**
 
-### Phase 1: Environment Detection
+---
 
-Detect the current runtime environment:
+### Phase 1: Environment Detection (MANDATORY — must display results before proceeding)
 
-- **Operating System**: Windows, macOS, or Linux
-- **Shell**: PowerShell, bash, zsh, etc.
-- **Git**: Verify `git --version` is available
-- **Target path**: User-specified or default to current working directory
-- **Search depth**: User-specified or default to 3 levels
+Detect and **explicitly display** the following before doing anything else:
 
-### Phase 2: Discover Repositories
+1. **Operating System**: Run a command to detect the OS.
+   - Windows: `[System.Environment]::OSVersion` or `$env:OS`
+   - macOS/Linux: `uname -s`
+2. **Shell environment**: Identify the current shell.
+   - PowerShell: `$PSVersionTable.PSVersion`
+   - bash/zsh: `echo $SHELL` and `echo $BASH_VERSION` or `echo $ZSH_VERSION`
+3. **Agent identity**: Identify which agent is running this skill (Claude Code, GitHub Copilot CLI, Cursor, etc.) based on the agent's own context/identity.
+4. **Git availability**: Run `git --version` to verify git is installed.
 
-Find all git repositories under the target directory:
+**Display the detection results clearly**, for example:
+```
+Environment Detection:
+  OS:    Windows 11 (10.0.22631)
+  Shell: PowerShell 7.4
+  Agent: GitHub Copilot CLI
+  Git:   git version 2.44.0.windows.1
+```
 
-| Environment | Command |
-|-------------|---------|
-| PowerShell | `Get-ChildItem -Path <target> -Recurse -Directory -Filter ".git" -Depth <N> -ErrorAction SilentlyContinue \| Select -ExpandProperty Parent \| Select -ExpandProperty FullName` |
-| bash/zsh | `find <target> -maxdepth <N> -type d -name ".git" -exec dirname {} \;` |
+**All subsequent phases MUST use ONLY commands appropriate for the detected OS and shell. Never mix platform commands.**
 
-Report: "Found X git repositories."
+---
 
-### Phase 3: Parallel Sync ⚡
+### Phase 2: Plan (discover repos and generate environment-specific steps)
 
-**THIS IS THE CRITICAL STEP — SYNC ALL REPOS IN PARALLEL, NOT SEQUENTIALLY!**
+#### Step 1: Discover Repositories
 
-Each repository sync is completely independent. Use the agent's maximum parallel execution capabilities:
+Use the appropriate command for the detected environment. **NOTE: `.git` directories are hidden — commands must handle hidden files/directories.**
 
-- **GitHub Copilot CLI**: Make multiple parallel tool calls — run `git -C <repo> pull --ff-only` for ALL repos simultaneously in one batch of tool calls. Use sub-agents (task tool with agent_type "task") for batches if needed.
-- **Claude Code**: Use Agent Teams / sub-agents — launch one sub-agent per batch of repositories for concurrent pulling.
-- **Other agents**: Use whatever parallel/concurrent execution mechanism is available.
+**For PowerShell (Windows):**
+```powershell
+Get-ChildItem -Path <target> -Recurse -Directory -Hidden -Filter ".git" -Depth <N> -ErrorAction SilentlyContinue | ForEach-Object { $_.Parent.FullName }
+```
+⚠️ **CRITICAL**: The `-Hidden` flag (or `-Force`) is REQUIRED because `.git` is a hidden directory on Windows. Without it, most or all repositories will be missed.
 
-**Per-repository sync logic:**
+**For bash/zsh (macOS/Linux):**
+```bash
+find <target> -maxdepth <N> -type d -name ".git" 2>/dev/null | sed 's/\/.git$//'
+```
+
+**For Git Bash on Windows:**
+```bash
+find <target> -maxdepth <N> -type d -name ".git" 2>/dev/null | sed 's/\/.git$//'
+```
+
+Default target: current working directory. Default depth: 3 levels.
+
+Display: "Found X git repositories." followed by the list.
+
+#### Step 2: Generate Parallel Execution Plan
+
+Based on the detected **agent identity**, plan the parallel strategy:
+
+| Agent | Parallel Strategy |
+|-------|------------------|
+| **GitHub Copilot CLI** | Use multiple parallel tool calls (powershell tool) to run `git pull` for all repos simultaneously. For large batches (20+), use sub-agents via the `task` tool. |
+| **Claude Code** | Use Agent Teams / TodoWrite+TodoRead pattern to dispatch sub-agents, one per batch of repos. |
+| **Other agents** | Use whatever parallel/concurrent execution mechanism is available. |
+
+**Display the plan** before executing, e.g.:
+```
+Plan: Sync 12 repositories in parallel
+  Strategy: 12 parallel tool calls (GitHub Copilot CLI)
+  Command per repo: git -C <path> pull --ff-only
+```
+
+---
+
+### Phase 3: Execute (parallel sync)
+
+**SYNC ALL REPOS IN PARALLEL, NOT SEQUENTIALLY!**
+
+For each repository, run in parallel:
 1. Check if a remote is configured: `git -C <repo> remote`
 2. If no remote → classify as "Skipped"
 3. If remote exists → run `git -C <repo> pull --ff-only`
 4. Classify result:
    - Output contains "Already up to date" → "Up to date"
-   - Pull succeeded → "Synced"
+   - Pull succeeded with changes → "Synced"
    - Pull failed → "Failed" (capture error message)
 
-### Phase 4: Summary Report
+**Never sync repos one by one. The whole point of this skill is parallelism.**
 
-After all parallel syncs complete, compile and display:
+---
+
+### Phase 4: Report & Recommendations
+
+#### Summary Report
 
 ```
 === Git Sync Summary ===
@@ -77,18 +127,10 @@ Failed repositories:
   - repo-name: error message
 ```
 
-## Error Handling
+#### Environment-Specific Recommendations
 
-- If a repo fails (e.g., merge conflict), report the error and continue with others
-- Use `--ff-only` to avoid creating merge commits — if fast-forward is not possible, report it as a failure
-- List all failed repos at the end for manual resolution
+Provide recommendations **ONLY for the detected environment**:
 
-## Parallelism Guidelines
-
-| Repo Count | Strategy |
-|------------|----------|
-| 1–5 | Run all in parallel in a single batch |
-| 6–20 | Run all in parallel — most agents handle this fine |
-| 20+ | Batch into groups of ~10, run each batch in parallel |
-
-The whole point of this skill is speed through parallelism. **Never sync repos one by one.**
+- **Windows PowerShell**: If repos failed due to path length, suggest enabling long paths: `git config --system core.longpaths true`. Suggest `git config --global credential.helper manager` for credential management.
+- **macOS/Linux bash**: If repos failed due to permissions, suggest `chmod` or SSH key setup. Suggest `git config --global credential.helper osxkeychain` (macOS) or `git config --global credential.helper store` (Linux).
+- **NEVER recommend commands from a different platform** (e.g., do NOT suggest `chmod` on Windows, do NOT suggest `credential.helper manager` on Linux).
