@@ -127,6 +127,14 @@ Detect and **explicitly display** the following before doing anything else.
      3. If auto-fix succeeded, proceed normally — do NOT re-prompt the user
      4. If auto-fix failed (e.g., user declined UAC, or command not found), THEN display a warning and skip elevated tasks (winget, Windows Update). Other tasks (npm, skills) can still proceed.
    - ⛔ **Do NOT stop execution to ask the user** whether to fix sudo. Just fix it. Only skip if the fix itself fails.
+6. **sudo status** (Linux only, required for apt):
+   - Check if sudo credentials are already cached (no password needed): `sudo -n true 2>/dev/null`
+   - If exit code 0 → credentials cached, proceed normally
+   - If exit code non-zero → password will be required. The agent should:
+     1. Inform the user that sudo will prompt for their password
+     2. Run `sudo -v` as the **first** sudo command — this prompts for the password and caches credentials (typically 15 minutes)
+     3. After `sudo -v` succeeds, all subsequent `sudo` commands will reuse the cached credentials without re-prompting
+     4. If `sudo -v` fails (wrong password, user cancelled), skip apt tasks and report the failure
 
 **Display the detection results clearly**, for example:
 ```
@@ -158,7 +166,7 @@ Environment Detection:
   node:    ✅ v22.0.0
   npm:     ✅ v10.8.0
   apt:     ✅ available
-  sudo:    ✅ available (Linux native)
+  sudo:    ✅ available (credentials cached / password will be needed)
 
 Applicable update tasks:
   1. sudo apt update → sudo apt upgrade -y (serial)
@@ -211,6 +219,8 @@ Run both global and project-level updates:
 
 ⚠️ **These two commands MUST run serially, NOT combined with `&&` in a single shell call.** Run them as two separate sequential commands so the agent can observe and report each step independently.
 
+0. **Pre-cache sudo credentials** (if not already cached from Phase 1):
+   Run `sudo -v` first — this prompts for the password once and caches credentials for subsequent `sudo` calls (typically 15 minutes). This ensures `apt update` and `apt upgrade` won't each prompt for the password separately.
 1. Run `sudo apt update -y 2>&1` — refresh package index
    - Wait for completion, capture and display output
    - If this fails, STOP — do not proceed to upgrade
