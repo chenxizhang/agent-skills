@@ -138,59 +138,56 @@ This serial approach allows the agent to:
 
 **Task E: Windows Update (Windows only, requires sudo in Inline mode)**
 
-This task uses PowerShell to trigger, install, and monitor Windows Update. It runs serially internally (scan → download → install → monitor).
+This task uses PSWindowsUpdate to scan, install, and monitor Windows Update. Like winget, it relies on **sudo credential caching** — once the user confirms UAC once (e.g., from a winget upgrade or the first sudo call), subsequent `sudo` calls within the cache window will NOT prompt again.
 
-⚠️ **All Windows Update steps run in a SINGLE elevated `sudo` call** to avoid repeated UAC confirmation prompts. The same sudo Inline mode check from Phase 1 applies — if sudo is not available or not in Inline/normal mode, skip this task and inform the user.
+⚠️ **Do NOT wrap commands in `sudo pwsh -Command "..."`** — this spawns a new process and may bypass sudo credential caching. Instead, use `sudo` directly with PowerShell cmdlets (same pattern as `sudo winget`).
 
-**Single sudo call — all steps combined:**
+**Step 1: Ensure PSWindowsUpdate module is available (no elevation needed)**
 
 ```powershell
-sudo pwsh -NoProfile -Command "
-  # Step 1: Ensure PSWindowsUpdate module
-  if (-not (Get-Module -ListAvailable PSWindowsUpdate)) {
-    Write-Output '📦 Installing PSWindowsUpdate module...'
-    Install-Module -Name PSWindowsUpdate -Force
-  }
-  Import-Module PSWindowsUpdate
-
-  # Step 2: Scan for updates
-  Write-Output '🔍 Scanning for Windows Updates...'
-  `$updates = Get-WindowsUpdate
-  if (-not `$updates -or `$updates.Count -eq 0) {
-    Write-Output '✅ Windows is up to date. No updates available.'
-    return
-  }
-  Write-Output `"Found `$(`$updates.Count) update(s):`"
-  `$updates | Format-Table -Property KB, Size, Title -AutoSize
-
-  # Step 3: Install all updates (no auto-reboot)
-  Write-Output '⬇️ Installing updates...'
-  Install-WindowsUpdate -AcceptAll -AutoReboot:`$false -Verbose
-
-  # Step 4: Check reboot status
-  Write-Output '🔄 Checking reboot status...'
-  `$reboot = Get-WURebootStatus -Silent
-  if (`$reboot) {
-    Write-Output '⚠️ A restart is required to complete Windows Update installation.'
-  } else {
-    Write-Output '✅ No reboot required. All updates installed successfully.'
-  }
-"
+if (-not (Get-Module -ListAvailable PSWindowsUpdate)) {
+    Install-Module -Name PSWindowsUpdate -Force -Scope CurrentUser
+}
+Import-Module PSWindowsUpdate
 ```
 
-**Why a single call?** Each `sudo` invocation triggers a separate UAC confirmation dialog. Combining all steps into one `sudo pwsh -Command "..."` ensures the user only confirms elevation **once**.
+**Step 2: Scan for available updates (requires elevation)**
 
-**Behavior details:**
-- If no updates are found, it exits early with "Windows is up to date"
-- `-AutoReboot:$false` ensures NO automatic reboot — the user decides when
-- The agent should capture and display all output from this single command
-- If the command fails partway through, report which step failed
+```powershell
+sudo pwsh -NoProfile -Command "Import-Module PSWindowsUpdate; Get-WindowsUpdate"
+```
 
-⚠️ **Important notes for Windows Update:**
-- This single command runs ALL steps in one elevated session — only one UAC prompt
+- This is the **first sudo call** — it triggers the UAC prompt and warms the credential cache
+- If no updates found, report "Windows is up to date" and skip remaining steps
+- If updates found, display the list with KB article IDs, titles, and sizes
+
+**Step 3: Install all updates (requires elevation, sudo cached)**
+
+```powershell
+sudo pwsh -NoProfile -Command "Import-Module PSWindowsUpdate; Install-WindowsUpdate -AcceptAll -AutoReboot:`$false -Verbose"
+```
+
+- `-AcceptAll`: accept all available updates without prompting
+- `-AutoReboot:$false`: do NOT reboot automatically — the user should decide when to reboot
+- sudo should NOT prompt again — credential is cached from Step 2
+- Capture and display output showing progress for each update
+
+**Step 4: Check reboot status (requires elevation, sudo cached)**
+
+```powershell
+sudo pwsh -NoProfile -Command "Import-Module PSWindowsUpdate; Get-WURebootStatus"
+```
+
+- sudo should NOT prompt again — credential is still cached
+- If reboot is required, clearly inform the user: "⚠️ A restart is required to complete Windows Update installation"
+- Do NOT trigger a reboot automatically
+
+⚠️ **sudo credential caching strategy:**
+- If Task A (winget) runs in parallel and triggers sudo first, Task E's sudo calls may already be cached
+- If Task E runs alone, Step 2 is the first sudo call that warms the cache; Steps 3-4 reuse it
+- PSWindowsUpdate cmdlets need `Import-Module` in each `sudo pwsh` call because each is a separate process
 - Windows Update can take a long time (minutes to hours) — set generous timeouts (initial_wait: 300+ seconds) and use `read_powershell` to poll
 - Some updates may fail if apps are in use — report failures and suggest closing apps
-- Driver updates and feature updates may be included — report what categories are being installed
 
 #### Parallel Strategy
 
@@ -234,10 +231,12 @@ For Task D (apt), the execution flow within the sub-agent:
 4. Parse output for summary (X upgraded, Y newly installed, Z held back)
 
 For Task E (Windows Update), the execution flow within the sub-agent:
-1. Run the single combined `sudo pwsh -NoProfile -Command "..."` command (only one UAC prompt)
-2. **Use generous timeouts** — Windows Update can be slow. Set `initial_wait: 300` and use `read_powershell` to poll for completion
-3. The command internally handles: module install → scan → install → reboot check
-4. Collect and report all output
+1. Install/import PSWindowsUpdate module (no elevation needed)
+2. Run `sudo pwsh -NoProfile -Command "Import-Module PSWindowsUpdate; Get-WindowsUpdate"` — first sudo call warms credential cache
+3. If updates exist, run `sudo pwsh -NoProfile -Command "Import-Module PSWindowsUpdate; Install-WindowsUpdate ..."` — sudo cached, no prompt
+4. **Use generous timeouts** — Windows Update can be slow. Set `initial_wait: 300` and use `read_powershell` to poll
+5. Run `sudo pwsh -NoProfile -Command "Import-Module PSWindowsUpdate; Get-WURebootStatus"` — sudo cached
+6. Collect and report results
 
 ---
 
