@@ -27,6 +27,12 @@ Update all system packages and developer tools in parallel — bringing everythi
 
 **Do NOT use any scripts. Do NOT skip or merge phases. Execute each phase in order.**
 
+⛔ **ABSOLUTELY FORBIDDEN on all platforms:**
+- Do NOT create temporary script files (`.ps1`, `.sh`, `.bat`, `.cmd`, or any other script file)
+- Do NOT use `Out-File`, `Set-Content`, `>`, or any file-writing mechanism to create scripts
+- ALL commands must be run directly via the agent's tool calls (powershell, write_powershell, bash, etc.)
+- If you find yourself wanting to create a script, STOP — run the commands directly instead
+
 ---
 
 ### Phase 1: Environment Detection (MANDATORY — must display results before proceeding)
@@ -45,11 +51,15 @@ Detect and **explicitly display** the following before doing anything else:
    - `node`/`npm`: `Get-Command node -ErrorAction SilentlyContinue` or `which node`
    - `apt`: `which apt` (Linux)
    - `PSWindowsUpdate` module (Windows): `Get-Module -ListAvailable PSWindowsUpdate`
-5. **sudo status** (Windows only, required for winget):
+5. **sudo status** (Windows only, required for winget and Windows Update):
    - Check if sudo exists: `Get-Command sudo -ErrorAction SilentlyContinue`
    - Check sudo mode: `sudo config`
-   - **If sudo is not installed**: ⛔ STOP winget updates. Tell user to enable sudo in **Settings → System → For Developers → Enable sudo**
-   - **If sudo mode is NOT `Inline`/`normal`**: ⛔ STOP winget updates. Tell user to run: `sudo sudo config --enable normal` (this requires a one-time UAC confirmation to switch to inline mode)
+   - **If sudo is not installed or not in Inline/normal mode**: Try to auto-fix BEFORE giving up:
+     1. Run `sudo sudo config --enable normal` — this may trigger a one-time UAC confirmation
+     2. Re-check: `sudo config` — verify mode is now `Inline` or `normal`
+     3. If auto-fix succeeded, proceed normally
+     4. If auto-fix failed (e.g., user declined UAC, or command not found), THEN display a warning and skip elevated tasks (winget, Windows Update). Other tasks (npm, skills) can still proceed.
+   - **Key principle: try to fix, only skip if fix fails**
 
 **Display the detection results clearly**, for example:
 ```
@@ -89,7 +99,7 @@ Applicable update tasks:
   3. npx skills update -g -y
 ```
 
-**CRITICAL: If on Windows and sudo is missing or not in Inline/normal mode, do NOT proceed with winget updates. Display a clear warning and instructions. Other tasks (npm, skills) can still proceed.**
+**CRITICAL: If on Windows and sudo is missing or not in Inline/normal mode, first try `sudo sudo config --enable normal` to auto-fix. Only if auto-fix fails should you skip winget and Windows Update tasks. Other tasks (npm, skills) can always proceed.**
 
 ---
 
@@ -104,10 +114,13 @@ Based on Phase 1 results, build the task list and parallel strategy.
 1. Run `winget upgrade` (no elevation) to list all upgradable packages
 2. Parse the output to extract package IDs
 3. If no packages to upgrade, skip
-4. Upgrade all packages **in parallel** (see Parallel Strategy for agent-specific approach)
+4. Upgrade **each package individually in parallel** (see Parallel Strategy for agent-specific approach)
 5. Collect results per package
 
-⚠️ **Internal parallelism is CRITICAL**: each package upgrade is independent — run them ALL in parallel, not sequentially.
+⚠️ **CRITICAL — per-package parallel upgrade rules:**
+- **DO**: `sudo winget upgrade --id <specific-package-id> --silent --accept-package-agreements --accept-source-agreements` for EACH package, run in parallel
+- **DO NOT**: `winget upgrade --all` or `sudo winget upgrade --all` — this runs serially and defeats the purpose of parallelism
+- Each package upgrade is independent — run them ALL in parallel, never sequentially
 
 **Task B: npm update -g (if Node.js installed)**
 
@@ -247,14 +260,16 @@ Plan: 3 parallel tracks (one UAC prompt via shared elevated session)
 For Task A (winget):
 1. Run `winget upgrade` to discover packages
 2. Parse package IDs from the table output (the ID column)
-3. For each package, launch a parallel tool call: `sudo winget upgrade --id <pkg> --silent --accept-package-agreements --accept-source-agreements`
-4. Collect all results
+3. For **each** package, launch a **separate** parallel tool call: `sudo winget upgrade --id <pkg> --silent --accept-package-agreements --accept-source-agreements`
+4. ⚠️ Do NOT use `winget upgrade --all` — it runs serially. Each package MUST be a separate parallel call.
+5. Collect all results
 
 For Task E (Windows Update):
 1. `sudo pwsh -NoProfile -Command "Import-Module PSWindowsUpdate; Get-WindowsUpdate"` — scan
 2. If updates exist: `sudo pwsh -NoProfile -Command "Import-Module PSWindowsUpdate; Install-WindowsUpdate -AcceptAll -AutoReboot:$false -Verbose"`
 3. `sudo pwsh -NoProfile -Command "Import-Module PSWindowsUpdate; Get-WURebootStatus"` — check reboot
 4. All sudo calls reuse cached credential — no additional UAC prompts
+5. ⚠️ Do NOT combine scan + install into one command. Run them as separate steps so the agent can observe each result.
 
 For Tasks B, C: run the single command and capture output.
 
@@ -262,12 +277,12 @@ For Tasks B, C: run the single command and capture output.
 
 1. Start shared elevated session: `powershell(command: "sudo pwsh -NoProfile", mode: "async")` — **one UAC prompt**
 2. In parallel, also launch Tasks B and C (no elevation needed)
-3. Inside elevated session via `write_powershell`:
-   a. Run winget Jobs (parallel package upgrades)
-   b. Wait for Jobs to complete, collect results
-   c. Import PSWindowsUpdate, run `Get-WindowsUpdate`
-   d. If updates exist, run `Install-WindowsUpdate` — use `read_powershell` with 60+ second delays
-   e. Run `Get-WURebootStatus`
+3. Inside elevated session, send commands **one at a time** via `write_powershell` (do NOT combine into one command):
+   a. Run winget Jobs (parallel package upgrades) — use `Start-Job` per package, NOT `winget upgrade --all`
+   b. Wait for Jobs to complete via `Wait-Job | Receive-Job`, collect results
+   c. `Import-Module PSWindowsUpdate` then `Get-WindowsUpdate` — scan for updates
+   d. If updates exist, `Install-WindowsUpdate -AcceptAll -AutoReboot:$false -Verbose` — use `read_powershell` with 60+ second delays
+   e. `Get-WURebootStatus` — check if reboot needed
 4. `stop_powershell` to close elevated session
 5. Collect results from all tracks
 
@@ -353,7 +368,11 @@ Provide recommendations **ONLY for the detected environment**:
 
 ## Notes
 
+- **NEVER create script files** (`.ps1`, `.sh`, `.bat`, `.cmd`) — run all commands directly via agent tool calls
+- **NEVER use `winget upgrade --all`** — always upgrade each package individually by `--id` for parallelism
+- **NEVER combine Windows Update steps** (scan + install + reboot check) into a single command — run each step separately so the agent can observe and react
 - The sudo requirement on Windows is specifically for winget and Windows Update — npm and skills updates typically don't need elevation
+- If sudo is missing or wrong mode on Windows, try `sudo sudo config --enable normal` before giving up
 - If only some tasks are applicable (e.g., no Node.js installed), run only the applicable ones
 - The user may request to run only specific tasks (e.g., "just update winget") — honor that and skip others
 - winget's table output format may vary by locale — the agent should parse it adaptively (look for the `Id` column header and the separator line of dashes)
