@@ -1,10 +1,10 @@
 ---
 name: update-all
-description: Update all system packages and tools in parallel — winget (Windows), npm globals, agent skills, and apt (Linux). Each update category runs as an independent parallel task, with winget packages also upgraded in parallel internally. Use when you want to bring everything up to date quickly.
+description: Update all system packages and tools in parallel — winget (Windows), Windows Update (Windows), npm globals, agent skills, and apt (Linux). Each update category runs as an independent parallel task, with winget packages also upgraded in parallel internally. Use when you want to bring everything up to date quickly.
 license: MIT
 metadata:
   author: chenxizhang
-  version: "1.0"
+  version: "2.0"
 ---
 
 # Update All
@@ -13,14 +13,15 @@ Update all system packages and developer tools in parallel — bringing everythi
 
 ## Update Tasks
 
-| Task | When to Run | Internal Parallelism |
-|------|-------------|---------------------|
+| Task | When to Run | Execution Mode |
+|------|-------------|----------------|
 | **winget upgrade** | Windows only | ✅ Each package upgraded in parallel |
+| **Windows Update** | Windows only | Serial (scan → download → install → monitor) |
 | **npm update -g** | If Node.js is installed | Single command |
 | **npx skills update -g -y** | If Node.js is installed | Single command |
-| **sudo apt update && sudo apt upgrade -y** | Linux only | Single command |
+| **sudo apt update → sudo apt upgrade -y** | Linux only | ⚠️ Serial (update first, then upgrade) |
 
-**All tasks are completely independent and MUST run in parallel.**
+**All tasks are completely independent and MUST run in parallel. However, some tasks have internal serial steps (apt, Windows Update) — those internal steps must run in order.**
 
 ## Strict Execution Flow
 
@@ -43,6 +44,7 @@ Detect and **explicitly display** the following before doing anything else:
    - `winget`: `Get-Command winget -ErrorAction SilentlyContinue` (Windows)
    - `node`/`npm`: `Get-Command node -ErrorAction SilentlyContinue` or `which node`
    - `apt`: `which apt` (Linux)
+   - `PSWindowsUpdate` module (Windows): `Get-Module -ListAvailable PSWindowsUpdate`
 5. **sudo status** (Windows only, required for winget):
    - Check if sudo exists: `Get-Command sudo -ErrorAction SilentlyContinue`
    - Check sudo mode: `sudo config`
@@ -60,11 +62,13 @@ Environment Detection:
   npm:     ✅ v10.8.0
   apt:     ❌ not available (Windows)
   sudo:    ✅ v1.0.1, Inline mode
+  PSWindowsUpdate: ✅ v2.2.1.5 installed
 
 Applicable update tasks:
   1. winget upgrade (parallel per package)
-  2. npm update -g
-  3. npx skills update -g -y
+  2. Windows Update (scan → install → monitor)
+  3. npm update -g
+  4. npx skills update -g -y
 ```
 
 Another example (Linux):
@@ -80,7 +84,7 @@ Environment Detection:
   sudo:    ✅ available (Linux native)
 
 Applicable update tasks:
-  1. sudo apt update && sudo apt upgrade -y
+  1. sudo apt update → sudo apt upgrade -y (serial)
   2. npm update -g
   3. npx skills update -g -y
 ```
@@ -116,10 +120,68 @@ Single command:
 Single command:
 - All platforms: `npx skills update -g -y 2>&1`
 
-**Task D: sudo apt update + upgrade (Linux only)**
+**Task D: sudo apt update → sudo apt upgrade (Linux only, MUST be serial)**
 
-Single command:
-- `sudo apt update -y && sudo apt upgrade -y 2>&1`
+⚠️ **These two commands MUST run serially, NOT combined with `&&` in a single shell call.** Run them as two separate sequential commands so the agent can observe and report each step independently.
+
+1. Run `sudo apt update -y 2>&1` — refresh package index
+   - Wait for completion, capture and display output
+   - If this fails, STOP — do not proceed to upgrade
+2. Run `sudo apt upgrade -y 2>&1` — upgrade all packages
+   - Wait for completion, capture and display output
+   - Report number of upgraded, newly installed, held back packages
+
+This serial approach allows the agent to:
+- Detect and report failures at each step
+- Show the user what's being updated before upgrading
+- Avoid running upgrade with a stale or broken package index
+
+**Task E: Windows Update (Windows only, requires elevation)**
+
+This task uses PowerShell to trigger, install, and monitor Windows Update. It runs serially internally (scan → download → install → monitor).
+
+**Step 1: Ensure PSWindowsUpdate module is available**
+
+```powershell
+if (-not (Get-Module -ListAvailable PSWindowsUpdate)) {
+    Install-Module -Name PSWindowsUpdate -Force -Scope CurrentUser
+}
+Import-Module PSWindowsUpdate
+```
+
+**Step 2: Scan for available updates**
+
+```powershell
+$updates = Get-WindowsUpdate
+```
+
+- If no updates found, report "Windows is up to date" and skip remaining steps
+- If updates found, display the list with KB article IDs, titles, and sizes
+
+**Step 3: Install all updates**
+
+```powershell
+Install-WindowsUpdate -AcceptAll -AutoReboot:$false -Verbose 2>&1
+```
+
+- `-AcceptAll`: accept all available updates without prompting
+- `-AutoReboot:$false`: do NOT reboot automatically — the user should decide when to reboot
+- Capture and display output showing progress for each update
+
+**Step 4: Check reboot status**
+
+```powershell
+Get-WURebootStatus
+```
+
+- If reboot is required, clearly inform the user: "⚠️ A restart is required to complete Windows Update installation"
+- Do NOT trigger a reboot automatically
+
+⚠️ **Important notes for Windows Update:**
+- This task requires **administrator/elevated privileges**. Use `sudo` if available (inline mode), otherwise inform the user that elevation is needed.
+- Windows Update can take a long time (minutes to hours) — set generous timeouts (initial_wait: 300+ seconds)
+- Some updates may fail if apps are in use — report failures and suggest closing apps
+- Driver updates and feature updates may be included — report what categories are being installed
 
 #### Parallel Strategy
 
@@ -127,17 +189,19 @@ Based on the detected **agent identity**:
 
 | Agent | Strategy |
 |-------|----------|
-| **GitHub Copilot CLI** | Launch Tasks A/B/C/D as parallel tool calls or sub-agents (task tool). For Task A's internal parallelism, use parallel tool calls for each winget package. |
-| **Claude Code** | Use Agent Teams to dispatch each task as a sub-agent. Task A's sub-agent internally parallelizes per-package upgrades. |
+| **GitHub Copilot CLI** | Launch Tasks A/B/C/D/E as parallel tool calls or sub-agents (task tool). For Task A's internal parallelism, use parallel tool calls for each winget package. Task D (apt) and Task E (Windows Update) are internally serial but run in parallel with other tasks. |
+| **Claude Code** | Use Agent Teams to dispatch each task as a sub-agent. Task A's sub-agent internally parallelizes per-package upgrades. Task D and E sub-agents handle their serial steps internally. |
 | **Other agents** | Use whatever parallel execution mechanism is available. |
 
 **Display the plan before executing**, e.g.:
 ```
-Plan: 3 parallel update tasks
+Plan: 5 parallel update tasks
   Task A: winget upgrade — 5 packages (parallel per package)
   Task B: npm update -g
   Task C: npx skills update -g -y
-  Strategy: 3 parallel sub-agents + Task A fans out 5 parallel winget calls
+  Task D: apt update → apt upgrade (serial steps)
+  Task E: Windows Update — scan → install → monitor (serial steps)
+  Strategy: 5 parallel sub-agents, Tasks A/D/E have internal serial steps
 ```
 
 ---
@@ -152,7 +216,21 @@ For Task A (winget), the execution flow within the sub-agent:
 3. For each package, launch a parallel tool call: `sudo winget upgrade --id <pkg> --silent --accept-package-agreements --accept-source-agreements`
 4. Collect all results
 
-For Tasks B, C, D: run the single command and capture output.
+For Tasks B, C: run the single command and capture output.
+
+For Task D (apt), the execution flow within the sub-agent:
+1. Run `sudo apt update -y 2>&1` and wait for completion
+2. Check exit code — if non-zero, report failure and STOP (do not run upgrade)
+3. Run `sudo apt upgrade -y 2>&1` and wait for completion
+4. Parse output for summary (X upgraded, Y newly installed, Z held back)
+
+For Task E (Windows Update), the execution flow within the sub-agent:
+1. Ensure PSWindowsUpdate module is available (install if needed)
+2. Run `Get-WindowsUpdate` to scan for available updates
+3. If updates exist, display the list and run `Install-WindowsUpdate -AcceptAll -AutoReboot:$false -Verbose 2>&1`
+4. **Use generous timeouts** — Windows Update can be slow. Set `initial_wait: 300` and use `read_powershell` to poll for completion
+5. After installation completes, run `Get-WURebootStatus` to check if reboot is needed
+6. Collect and report results
 
 ---
 
@@ -174,17 +252,27 @@ Agent:     <agent>
   [✗] SomeApp.Failed — installer error (exit code 1)
   Succeeded: 2 / Failed: 1
 
+── Windows Update ──────────────────────────────────
+  [✓] KB5034441 — Security Update (45 MB)
+  [✓] KB5034123 — .NET Runtime Update (12 MB)
+  [⚠] Reboot required to complete installation
+  Succeeded: 2 / Failed: 0
+
 ── npm update -g ───────────────────────────────────
   [✓] Updated 3 packages
 
 ── npx skills update -g -y ─────────────────────────
   [✓] All skills up to date
 
-── apt upgrade (Linux only) ────────────────────────
-  (not applicable — Windows)
+── apt update ──────────────────────────────────────
+  [✓] Package index refreshed (42 packages can be upgraded)
+
+── apt upgrade ─────────────────────────────────────
+  [✓] 42 packages upgraded, 0 newly installed, 0 held back
 
 ================================================================================
-Total tasks: 3 | Succeeded: 2 | Partial: 1 (winget had 1 failure)
+Total tasks: 5 | Succeeded: 4 | Partial: 1 (winget had 1 failure)
+⚠️ Reboot required for Windows Update
 ================================================================================
 ```
 
@@ -196,10 +284,15 @@ Provide recommendations **ONLY for the detected environment**:
 - If winget packages failed, suggest retrying individually: `sudo winget upgrade --id <pkg> --silent --accept-package-agreements --accept-source-agreements`
 - If a package failed due to "in use", suggest closing the application first
 - If sudo was not in Inline mode, remind: `sudo sudo config --enable normal`
+- If Windows Update requires reboot, inform: "Please restart your computer to complete the update installation. You can do this when convenient."
+- If Windows Update failed to install some updates, suggest: "Try running Windows Update again after a reboot, or check Windows Update settings in Settings → Windows Update"
+- If PSWindowsUpdate module installation failed, suggest: "Run PowerShell as Administrator and try: `Install-Module -Name PSWindowsUpdate -Force`"
 - Never suggest `chmod`, `apt`, or other Linux/macOS commands
 
 **Linux:**
-- If apt upgrade failed, suggest `sudo apt --fix-broken install`
+- If `apt update` failed, suggest checking network connectivity and sources list: `cat /etc/apt/sources.list`
+- If `apt upgrade` failed, suggest `sudo apt --fix-broken install`
+- If packages were held back, inform the user and suggest `sudo apt full-upgrade` if they want to force them
 - If npm update failed with permission errors, suggest checking npm prefix: `npm config get prefix`
 - Never suggest `winget`, `sudo config`, or other Windows commands
 
@@ -211,7 +304,11 @@ Provide recommendations **ONLY for the detected environment**:
 
 ## Notes
 
-- The sudo requirement on Windows is specifically for winget — npm and skills updates typically don't need elevation
+- The sudo requirement on Windows is specifically for winget and Windows Update — npm and skills updates typically don't need elevation
 - If only some tasks are applicable (e.g., no Node.js installed), run only the applicable ones
 - The user may request to run only specific tasks (e.g., "just update winget") — honor that and skip others
 - winget's table output format may vary by locale — the agent should parse it adaptively (look for the `Id` column header and the separator line of dashes)
+- Windows Update can take a very long time — always use generous timeouts (300+ seconds) and poll for completion
+- Windows Update will NEVER trigger an automatic reboot — the agent must inform the user and let them decide
+- On Linux, `apt update` and `apt upgrade` are intentionally separate commands (not combined with `&&`) for better observability and error handling
+- If `PSWindowsUpdate` module is not available and cannot be installed, skip Windows Update and inform the user
