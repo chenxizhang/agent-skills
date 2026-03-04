@@ -4,7 +4,7 @@ description: Update all system packages and tools in parallel — winget (Window
 license: MIT
 metadata:
   author: chenxizhang
-  version: "2.0"
+  version: "3.0"
 ---
 
 # Update All
@@ -35,24 +35,90 @@ Update all system packages and developer tools in parallel — bringing everythi
 
 ---
 
+### Agent Capability Reference
+
+Different agents have different shell models. **You MUST use the correct strategy for your agent.**
+
+| Agent | Shell | Persistent Session? | Tools Available |
+|-------|-------|---------------------|-----------------|
+| **GitHub Copilot CLI** | PowerShell (native) | ✅ Yes — `powershell` tool with `mode: "async"`, `write_powershell`, `read_powershell`, `stop_powershell` | Full interactive session support |
+| **Claude Code** | Bash (even on Windows via Git Bash/WSL) | ❌ No — each `Bash` tool call is a one-shot command | One-shot commands only, no interactive sessions |
+| **Cursor / Other** | Varies | Check agent docs | Adapt accordingly |
+
+### Calling PowerShell from Bash (Claude Code on Windows)
+
+When the agent's shell is bash (e.g., Claude Code), use these patterns to call PowerShell commands:
+
+**Simple command — use single quotes to avoid bash interpolation:**
+```bash
+pwsh -NoProfile -Command 'Get-Command winget -ErrorAction SilentlyContinue'
+```
+
+**Command with PowerShell variables — use single quotes (bash won't expand `$`):**
+```bash
+pwsh -NoProfile -Command '$m = Get-Module -ListAvailable PSWindowsUpdate; if ($m) { "v$($m.Version)" } else { "not installed" }'
+```
+
+**Multi-line complex command — use quoted heredoc:**
+```bash
+pwsh -NoProfile -Command "$(cat <<'PWSH'
+$packages = @("pkg1", "pkg2", "pkg3")
+$jobs = $packages | ForEach-Object {
+    Start-Job -ScriptBlock { param($id); winget upgrade --id $id --silent --accept-package-agreements --accept-source-agreements 2>&1 } -ArgumentList $_
+}
+$jobs | Wait-Job | Receive-Job
+$jobs | Remove-Job
+PWSH
+)"
+```
+
+⚠️ **Key rule**: Always use **single quotes** around PowerShell code in bash, or use a **heredoc with `<<'PWSH'`** (quoted delimiter prevents bash expansion). NEVER use double quotes with `$` — bash will try to expand PowerShell variables and break the command.
+
+### Recommended Timeouts
+
+| Command | Timeout |
+|---------|---------|
+| Environment detection (Phase 1) | 30s |
+| `winget upgrade` (list packages) | 60s |
+| Single `winget upgrade --id <pkg>` | 120s |
+| `npm update -g` | 120s |
+| `npx skills update -g -y` | 120s |
+| Windows Update scan (`Get-WindowsUpdate`) | 120s |
+| Windows Update install (`Install-WindowsUpdate`) | 600s (10 min) |
+| `sudo apt update` | 60s |
+| `sudo apt upgrade` | 300s (5 min) |
+
+For GitHub Copilot CLI: use `initial_wait` parameter on `powershell` tool calls.
+For Claude Code: use `timeout` parameter on Bash tool calls (in milliseconds: multiply seconds × 1000).
+
+---
+
 ### Phase 1: Environment Detection (MANDATORY — must display results before proceeding)
 
-Detect and **explicitly display** the following before doing anything else:
+Detect and **explicitly display** the following before doing anything else.
 
-1. **Operating System**:
-   - Windows: `[System.Environment]::OSVersion` or `$env:OS`
-   - macOS/Linux: `uname -s` and `cat /etc/os-release 2>/dev/null | head -3`
-2. **Shell environment**:
-   - PowerShell: `$PSVersionTable.PSVersion`
-   - bash/zsh: `echo $SHELL`
+**Prefer bash-native commands where possible** — only invoke `pwsh` when genuinely needed (e.g., PSWindowsUpdate check). This reduces escaping issues and errors.
+
+| Detection | Bash / Shell-native | Only if pwsh needed |
+|-----------|---------------------|---------------------|
+| OS version | `uname -s` / `cat /etc/os-release` | `pwsh -NoProfile -Command '[System.Environment]::OSVersion'` (for detailed Windows version) |
+| Shell | `echo $SHELL` or `$PSVersionTable` | — |
+| winget | `which winget` or `winget --version` | — |
+| node/npm | `node --version` / `npm --version` | — |
+| apt | `which apt` | — |
+| sudo | `which sudo` / `sudo config` | — |
+| PSWindowsUpdate | — | `pwsh -NoProfile -Command 'Get-Module -ListAvailable PSWindowsUpdate'` |
+
+1. **Operating System**: `uname -s` (all platforms), or `winget --version` to confirm Windows
+2. **Shell environment**: Note which shell you are running in (PowerShell, bash, zsh)
 3. **Agent identity**: Identify which agent is running (Claude Code, GitHub Copilot CLI, Cursor, etc.)
-4. **Available tools** — check which of the following are installed:
-   - `winget`: `Get-Command winget -ErrorAction SilentlyContinue` (Windows)
-   - `node`/`npm`: `Get-Command node -ErrorAction SilentlyContinue` or `which node`
-   - `apt`: `which apt` (Linux)
-   - `PSWindowsUpdate` module (Windows): `Get-Module -ListAvailable PSWindowsUpdate`
+4. **Available tools** — use simple commands:
+   - `winget`: `winget --version 2>/dev/null` or `which winget`
+   - `node`/`npm`: `node --version 2>/dev/null` / `npm --version 2>/dev/null`
+   - `apt`: `which apt 2>/dev/null`
+   - `PSWindowsUpdate` module (Windows only): `pwsh -NoProfile -Command 'Get-Module -ListAvailable PSWindowsUpdate'`
 5. **sudo status** (Windows only, required for winget and Windows Update):
-   - Check if sudo exists: `Get-Command sudo -ErrorAction SilentlyContinue`
+   - Check if sudo exists: `which sudo` or `sudo --version 2>/dev/null`
    - Check sudo mode: `sudo config`
    - **If sudo is not installed or not in Inline/normal mode**: Try to auto-fix BEFORE giving up:
      1. Run `sudo sudo config --enable normal` — this may trigger a one-time UAC confirmation
@@ -111,14 +177,15 @@ Based on Phase 1 results, build the task list and parallel strategy.
 
 **Task A: winget upgrade (Windows only, requires elevation)**
 
-1. Run `winget upgrade` (no elevation) to list all upgradable packages
-2. Parse the output to extract package IDs
+1. Run `winget upgrade --accept-source-agreements --disable-interactivity` (no elevation) to list all upgradable packages
+   - The `--disable-interactivity` flag suppresses spinner characters (`- \ |`) that make output hard to parse
+2. Parse the output to extract package IDs — look for the table header with `Name`, `Id`, `Version`, `Available` columns, then extract the `Id` value from each row
 3. If no packages to upgrade, skip
 4. Upgrade **each package individually in parallel** (see Parallel Strategy for agent-specific approach)
 5. Collect results per package
 
 ⚠️ **CRITICAL — per-package parallel upgrade rules:**
-- **DO**: `sudo winget upgrade --id <specific-package-id> --silent --accept-package-agreements --accept-source-agreements` for EACH package, run in parallel
+- **DO**: `sudo winget upgrade --id <specific-package-id> --silent --accept-package-agreements --accept-source-agreements --disable-interactivity` for EACH package, run in parallel
 - **DO NOT**: `winget upgrade --all` or `sudo winget upgrade --all` — this runs serially and defeats the purpose of parallelism
 - Each package upgrade is independent — run them ALL in parallel, never sequentially
 
@@ -193,44 +260,50 @@ All tasks run in parallel. Each `sudo` reuses the cached credential. **One UAC p
 
 ---
 
-**Strategy for Claude Code: ONE shared elevated session (one UAC prompt total)**
+**Strategy for Claude Code: ONE elevated command combining all elevated tasks (one UAC prompt total)**
 
-Since Claude Code spawns a new process per command, open **one `sudo pwsh` async session** and run ALL elevated tasks (winget + Windows Update) inside it. Non-elevated tasks (npm, skills) run in parallel outside.
+Since Claude Code spawns a new process per Bash tool call and has NO persistent shell sessions (no `write_powershell`, `read_powershell`, or `stop_powershell` — those are Copilot CLI only), you MUST combine all elevated work into a single `sudo pwsh -Command` call.
+
+Use the heredoc pattern to build a single PowerShell command that:
+1. Runs winget upgrades in parallel via `Start-Job`
+2. Runs Windows Update serially (scan → install → reboot check)
 
 ```
-┌─ powershell(command: "sudo pwsh -NoProfile", mode: "async") ──── ONE UAC prompt
-│
-│  ── winget (parallel via PowerShell Jobs) ──
-│  $packages = @("<pkg1>", "<pkg2>", "<pkg3>")
-│  $jobs = $packages | ForEach-Object {
-│      Start-Job -ScriptBlock {
-│          param($id)
-│          winget upgrade --id $id --silent --accept-package-agreements --accept-source-agreements 2>&1
-│      } -ArgumentList $_
-│  }
-│  $jobs | Wait-Job | Receive-Job
-│  $jobs | Remove-Job
-│
-│  ── Windows Update (serial) ──
-│  Import-Module PSWindowsUpdate
-│  Get-WindowsUpdate
-│  Install-WindowsUpdate -AcceptAll -AutoReboot:$false -Verbose
-│  Get-WURebootStatus
-│
-└─ stop_powershell: close the elevated session
+parallel (launch all at once):
+  Track 1: sudo pwsh -NoProfile -Command "$(cat <<'PWSH'
+    # --- winget parallel upgrades ---
+    $packages = @("<pkg1>", "<pkg2>", "<pkg3>")
+    $jobs = $packages | ForEach-Object {
+        Start-Job -ScriptBlock {
+            param($id)
+            winget upgrade --id $id --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1
+        } -ArgumentList $_
+    }
+    $jobs | Wait-Job | Receive-Job
+    $jobs | Remove-Job
 
-parallel (no elevation needed):
-  Task B: npm update -g
-  Task C: npx skills update -g -y
+    # --- Windows Update (serial) ---
+    if (-not (Get-Module -ListAvailable PSWindowsUpdate)) {
+        Install-Module -Name PSWindowsUpdate -Force
+    }
+    Import-Module PSWindowsUpdate
+    $updates = Get-WindowsUpdate
+    if (-not $updates) { Write-Output "No Windows Updates available"; return }
+    Install-WindowsUpdate -AcceptAll -AutoReboot:$false -Verbose
+    Get-WURebootStatus
+  PWSH
+  )"
+  Track 2: npm update -g 2>&1
+  Track 3: npx skills update -g -y 2>&1
 ```
 
 **Key points:**
-- ONE `sudo pwsh` session = ONE UAC prompt for both winget and Windows Update
-- winget packages run in parallel via `Start-Job` inside the session
-- Windows Update runs serially after winget completes (both need the same elevated session)
-- npm and skills updates run in parallel OUTSIDE the elevated session (they don't need elevation)
-- The agent sends commands step-by-step via `write_powershell`, observing output at each step
-- Use `read_powershell` with generous delays (60+ seconds) for Windows Update progress
+- ONE `sudo pwsh` call = ONE UAC prompt for both winget and Windows Update
+- winget packages run in parallel via `Start-Job` inside that single command
+- Windows Update runs serially after winget completes (same elevated process)
+- npm and skills updates run in parallel OUTSIDE the elevated command (they don't need elevation)
+- Use a generous timeout (600s / 600000ms) for Track 1 since Windows Update can be slow
+- Do NOT use `write_powershell` or `read_powershell` — Claude Code does not have these tools
 
 **Display the plan before executing**, e.g. (GitHub Copilot CLI):
 ```
@@ -258,9 +331,9 @@ Plan: 3 parallel tracks (one UAC prompt via shared elevated session)
 **GitHub Copilot CLI execution:**
 
 For Task A (winget):
-1. Run `winget upgrade` to discover packages
+1. Run `winget upgrade --accept-source-agreements --disable-interactivity` to discover packages
 2. Parse package IDs from the table output (the ID column)
-3. For **each** package, launch a **separate** parallel tool call: `sudo winget upgrade --id <pkg> --silent --accept-package-agreements --accept-source-agreements`
+3. For **each** package, launch a **separate** parallel tool call: `sudo winget upgrade --id <pkg> --silent --accept-package-agreements --accept-source-agreements --disable-interactivity`
 4. ⚠️ Do NOT use `winget upgrade --all` — it runs serially. Each package MUST be a separate parallel call.
 5. Collect all results
 
@@ -275,16 +348,19 @@ For Tasks B, C: run the single command and capture output.
 
 **Claude Code execution:**
 
-1. Start shared elevated session: `powershell(command: "sudo pwsh -NoProfile", mode: "async")` — **one UAC prompt**
-2. In parallel, also launch Tasks B and C (no elevation needed)
-3. Inside elevated session, send commands **one at a time** via `write_powershell` (do NOT combine into one command):
-   a. Run winget Jobs (parallel package upgrades) — use `Start-Job` per package, NOT `winget upgrade --all`
-   b. Wait for Jobs to complete via `Wait-Job | Receive-Job`, collect results
-   c. `Import-Module PSWindowsUpdate` then `Get-WindowsUpdate` — scan for updates
-   d. If updates exist, `Install-WindowsUpdate -AcceptAll -AutoReboot:$false -Verbose` — use `read_powershell` with 60+ second delays
-   e. `Get-WURebootStatus` — check if reboot needed
-4. `stop_powershell` to close elevated session
-5. Collect results from all tracks
+1. First, build the winget package list: `winget upgrade --accept-source-agreements --disable-interactivity` (no sudo needed for listing)
+2. Parse package IDs from the output
+3. Launch ALL tracks in parallel:
+   - **Track 1 (elevated, one UAC prompt):** Build and run a single `sudo pwsh -NoProfile -Command "$(cat <<'PWSH' ... PWSH)"` that contains:
+     - winget `Start-Job` blocks for each package (parallel)
+     - `Wait-Job | Receive-Job` to collect winget results
+     - PSWindowsUpdate import, scan, install, reboot check (serial)
+   - **Track 2:** `npm update -g 2>&1` (no elevation)
+   - **Track 3:** `npx skills update -g -y 2>&1` (no elevation)
+4. Set timeout for Track 1 to at least 600s (600000ms) — Windows Update can be very slow
+5. Collect and display results from all tracks
+
+⚠️ **Do NOT use `write_powershell`, `read_powershell`, or `stop_powershell`** — these are GitHub Copilot CLI tools and do NOT exist in Claude Code. Use bash one-shot commands only.
 
 **Linux execution (all agents):**
 
@@ -345,7 +421,7 @@ Total tasks: 5 | Succeeded: 4 | Partial: 1 (winget had 1 failure)
 Provide recommendations **ONLY for the detected environment**:
 
 **Windows:**
-- If winget packages failed, suggest retrying individually: `sudo winget upgrade --id <pkg> --silent --accept-package-agreements --accept-source-agreements`
+- If winget packages failed, suggest retrying individually: `sudo winget upgrade --id <pkg> --silent --accept-package-agreements --accept-source-agreements --disable-interactivity`
 - If a package failed due to "in use", suggest closing the application first
 - If sudo was not in Inline mode, remind: `sudo sudo config --enable normal`
 - If Windows Update requires reboot, inform: "Please restart your computer to complete the update installation. You can do this when convenient."
@@ -375,7 +451,7 @@ Provide recommendations **ONLY for the detected environment**:
 - If sudo is missing or wrong mode on Windows, try `sudo sudo config --enable normal` before giving up
 - If only some tasks are applicable (e.g., no Node.js installed), run only the applicable ones
 - The user may request to run only specific tasks (e.g., "just update winget") — honor that and skip others
-- winget's table output format may vary by locale — the agent should parse it adaptively (look for the `Id` column header and the separator line of dashes)
+- winget's table output format may vary by locale — the agent should parse it adaptively (look for the `Id` column header and the separator line of dashes). Always use `--disable-interactivity` to suppress spinner characters that interfere with parsing.
 - Windows Update can take a very long time — always use generous timeouts (300+ seconds) and poll for completion
 - Windows Update will NEVER trigger an automatic reboot — the agent must inform the user and let them decide
 - On Linux, `apt update` and `apt upgrade` are intentionally separate commands (not combined with `&&`) for better observability and error handling
