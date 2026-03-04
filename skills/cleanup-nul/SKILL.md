@@ -2,10 +2,9 @@
 name: cleanup-nul
 description: Find and delete 'nul' files accidentally created by tools on Windows. Use when cleaning up spurious nul files from a directory tree.
 license: MIT
-compatibility: Works on Windows, macOS, and Linux. Primarily useful on Windows where nul files are problematic.
 metadata:
   author: chenxizhang
-  version: "1.0"
+  version: "2.0"
 ---
 
 # Cleanup NUL Files
@@ -16,45 +15,41 @@ Find and remove `nul` files that are accidentally created by some tools (like Cl
 
 On Windows, `nul` is a reserved device name (like `/dev/null` on Unix). Some tools may accidentally create actual files named `nul`, which can cause issues. This skill helps locate and remove them.
 
-## Usage
+## Execution Strategy
 
-```bash
-bash scripts/cleanup.sh [path]
-```
+**Do NOT use any scripts. Execute all commands directly through the agent's shell/tool capabilities.**
 
-## Options
+### Phase 1: Environment Detection
 
-- `--dry-run`: Show files that would be deleted without actually deleting
-- `path`: Directory to scan (default: current directory)
+Detect the current runtime environment before doing anything:
 
-## Examples
+- **Operating System**: Windows, macOS, or Linux
+- **Shell**: PowerShell, cmd, bash, zsh, etc.
+- **Target path**: User-specified or default to current working directory
 
-```bash
-# Preview what would be deleted
-bash scripts/cleanup.sh --dry-run /c/work
+### Phase 2: Find NUL Files
 
-# Actually delete the files
-bash scripts/cleanup.sh /c/work
+Use the appropriate command for the detected environment:
 
-# Clean current directory
-bash scripts/cleanup.sh
-```
+| Environment | Command |
+|-------------|---------|
+| PowerShell (Windows) | `Get-ChildItem -Path <target> -Recurse -Filter "nul" -File -ErrorAction SilentlyContinue` |
+| bash/zsh (macOS/Linux) | `find <target> -name "nul" -type f 2>/dev/null` |
+| cmd (Windows) | `dir /s /b <target>\nul` |
 
-## Output
+### Phase 3: Report and Clean
 
-```
-Scanning for 'nul' files in /c/work...
+1. List all found `nul` files with their full paths
+2. Report the total count
+3. **Ask the user for confirmation before deleting**
+4. Delete files using the appropriate command for the environment:
+   - PowerShell: `Remove-Item -Path <file> -Force`
+   - bash/zsh: `rm -f <file>`
+   - If standard deletion fails on Windows (reserved name), try: `Remove-Item -LiteralPath "\\?\<full-path>" -Force`
+5. Report results (deleted count, any failures)
 
-Found 3 nul files:
-  /c/work/nul
-  /c/work/project-a/nul
-  /c/work/project-b/src/nul
+## Notes
 
-Delete these files? [y/N]: y
-
-Deleted: /c/work/nul
-Deleted: /c/work/project-a/nul
-Deleted: /c/work/project-b/src/nul
-
-Done. Removed 3 files.
-```
+- Always confirm with the user before deleting any files
+- This is a simple task — no parallelism needed unless scanning multiple large directory trees
+- If scanning multiple separate root paths, those scans CAN be parallelized

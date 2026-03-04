@@ -1,63 +1,27 @@
-# Agent Skills Collection
+# Agent Skills
 
-A collection of agent skills following the [agentskills.io](https://agentskills.io/) specification.
+Cross-platform agent skills following the [skills.sh](https://skills.sh/) open ecosystem.
 
-## Compatibility
-
-These skills are designed to work with:
-- Claude Code
-- Copilot CLI
-- Other agents supporting the agentskills.io format
-
-All skills are cross-platform compatible (Windows, macOS, Linux).
-
-## Structure
-
-```
-skills/
-├── skill-name/
-│   ├── SKILL.md          # Required: skill definition
-│   ├── scripts/          # Optional: executable scripts
-│   ├── references/       # Optional: additional documentation
-│   └── assets/           # Optional: static resources
-```
-
-## Installation
-
-### Claude Code
+## Install
 
 ```bash
-claude skill add /path/to/skills/skill-name
+# Install individual skills
+npx skills add chenxizhang/agent-skills/cleanup-nul
+npx skills add chenxizhang/agent-skills/git-sync-all
+npx skills add chenxizhang/agent-skills/system-health-check
 ```
 
-### Copilot CLI
+## Available Skills
 
-```bash
-# Follow copilot-cli skill installation instructions
-```
+| Skill | Description |
+|-------|-------------|
+| [cleanup-nul](skills/cleanup-nul) | Find and delete `nul` files accidentally created by tools on Windows |
+| [git-sync-all](skills/git-sync-all) | Recursively find all git repos and pull latest changes **in parallel** |
+| [system-health-check](skills/system-health-check) | Parallel security, performance, and optimization scanning |
 
-## Creating a New Skill
+All skills are instruction-driven (no scripts), dynamically adapt to your OS/shell, and leverage agent parallelism.
 
-1. Create a directory under `skills/` with your skill name (lowercase, hyphens allowed)
-2. Add a `SKILL.md` file with required frontmatter:
+## Learn More
 
-```yaml
----
-name: your-skill-name
-description: What this skill does and when to use it.
----
-
-# Your Skill Instructions
-
-Step-by-step instructions for the agent...
-```
-
-## Validation
-
-```bash
-skills-ref validate ./skills/your-skill-name
-```
-
-## License
-
-See individual skill directories for their respective licenses.
+- [skills.sh](https://skills.sh/) — The open agent skills ecosystem
+- [AGENTS.md](AGENTS.md) — Contributor guidelines
