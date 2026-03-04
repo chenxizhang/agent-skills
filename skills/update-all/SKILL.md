@@ -18,7 +18,7 @@ Update all system packages and developer tools in parallel — bringing everythi
 | **winget upgrade** | Windows only | ✅ Each package upgraded in parallel |
 | **Windows Update** | Windows only | Serial (scan → download → install → monitor) |
 | **npm update -g** | If Node.js is installed | Single command |
-| **npx skills update -g -y** | If Node.js is installed | Single command |
+| **npx skills update** | If Node.js is installed | Check global & project-level |
 | **sudo apt update → sudo apt upgrade -y** | Linux only | ⚠️ Serial (update first, then upgrade) |
 
 **All tasks are completely independent and MUST run in parallel. However, some tasks have internal serial steps (apt, Windows Update) — those internal steps must run in order.**
@@ -82,7 +82,8 @@ PWSH
 | `winget upgrade` (list packages) | 60s |
 | Single `winget upgrade --id <pkg>` | 120s |
 | `npm update -g` | 120s |
-| `npx skills update -g -y` | 120s |
+| `npx skills update -g -y` (global) | 120s |
+| `npx skills update -y` (project) | 120s |
 | Windows Update scan (`Get-WindowsUpdate`) | 120s |
 | Windows Update install (`Install-WindowsUpdate`) | 600s (10 min) |
 | `sudo apt update` | 60s |
@@ -120,12 +121,12 @@ Detect and **explicitly display** the following before doing anything else.
 5. **sudo status** (Windows only, required for winget and Windows Update):
    - Check if sudo exists: `which sudo` or `sudo --version 2>/dev/null`
    - Check sudo mode: `sudo config`
-   - **If sudo is not installed or not in Inline/normal mode**: Try to auto-fix BEFORE giving up:
+   - **If sudo is not installed or not in Inline/normal mode**: Auto-fix IMMEDIATELY — do NOT stop and ask the user:
      1. Run `sudo sudo config --enable normal` — this may trigger a one-time UAC confirmation
      2. Re-check: `sudo config` — verify mode is now `Inline` or `normal`
-     3. If auto-fix succeeded, proceed normally
+     3. If auto-fix succeeded, proceed normally — do NOT re-prompt the user
      4. If auto-fix failed (e.g., user declined UAC, or command not found), THEN display a warning and skip elevated tasks (winget, Windows Update). Other tasks (npm, skills) can still proceed.
-   - **Key principle: try to fix, only skip if fix fails**
+   - ⛔ **Do NOT stop execution to ask the user** whether to fix sudo. Just fix it. Only skip if the fix itself fails.
 
 **Display the detection results clearly**, for example:
 ```
@@ -144,7 +145,7 @@ Applicable update tasks:
   1. winget upgrade (parallel per package)
   2. Windows Update (scan → install → monitor)
   3. npm update -g
-  4. npx skills update -g -y
+  4. npx skills update (global + project)
 ```
 
 Another example (Linux):
@@ -162,10 +163,10 @@ Environment Detection:
 Applicable update tasks:
   1. sudo apt update → sudo apt upgrade -y (serial)
   2. npm update -g
-  3. npx skills update -g -y
+  3. npx skills update (global + project)
 ```
 
-**CRITICAL: If on Windows and sudo is missing or not in Inline/normal mode, first try `sudo sudo config --enable normal` to auto-fix. Only if auto-fix fails should you skip winget and Windows Update tasks. Other tasks (npm, skills) can always proceed.**
+**CRITICAL: If on Windows and sudo is missing or not in Inline/normal mode, auto-fix with `sudo sudo config --enable normal` immediately — do NOT ask the user. Only if auto-fix fails should you skip winget and Windows Update tasks. Other tasks (npm, skills) can always proceed.**
 
 ---
 
@@ -188,6 +189,7 @@ Based on Phase 1 results, build the task list and parallel strategy.
 - **DO**: `sudo winget upgrade --id <specific-package-id> --silent --accept-package-agreements --accept-source-agreements --disable-interactivity` for EACH package, run in parallel
 - **DO NOT**: `winget upgrade --all` or `sudo winget upgrade --all` — this runs serially and defeats the purpose of parallelism
 - Each package upgrade is independent — run them ALL in parallel, never sequentially
+- **Exception**: If only 1 package needs upgrading, you may use `sudo winget upgrade --id <pkg> ...` directly (no need for parallel infrastructure)
 
 **Task B: npm update -g (if Node.js installed)**
 
@@ -195,10 +197,15 @@ Single command:
 - Windows PowerShell: `npm update -g 2>&1`
 - bash/zsh: `npm update -g 2>&1`
 
-**Task C: npx skills update -g -y (if Node.js installed)**
+**Task C: npx skills update (if Node.js installed)**
 
-Single command:
-- All platforms: `npx skills update -g -y 2>&1`
+Run both global and project-level updates:
+1. Check if global skills exist: `npx skills list -g 2>&1`
+   - If global skills found: `npx skills update -g -y 2>&1`
+   - If no global skills: skip global update, report "No global skills installed"
+2. Check if project-level skills exist (look for `skills-lock.json` in the current directory or common project dirs):
+   - If found: `npx skills update -y 2>&1` (without `-g`)
+   - If not found: skip project update
 
 **Task D: sudo apt update → sudo apt upgrade (Linux only, MUST be serial)**
 
@@ -252,7 +259,7 @@ sudo credential caching means all `sudo` calls share one UAC prompt. Use the age
 parallel:
   Task A: multiple parallel `sudo winget upgrade --id <pkg> ...` tool calls
   Task B: npm update -g
-  Task C: npx skills update -g -y
+  Task C: npx skills update (global + project)
   Task E: sequential sudo calls for WU (scan → install → reboot check)
 ```
 
@@ -294,7 +301,7 @@ parallel (launch all at once):
   PWSH
   )"
   Track 2: npm update -g 2>&1
-  Track 3: npx skills update -g -y 2>&1
+  Track 3: npx skills update -g -y 2>&1 && npx skills update -y 2>&1
 ```
 
 **Key points:**
@@ -310,7 +317,7 @@ parallel (launch all at once):
 Plan: 4 parallel update tasks (one UAC prompt via sudo caching)
   Task A: winget upgrade — 5 packages (parallel sudo calls)
   Task B: npm update -g
-  Task C: npx skills update -g -y
+  Task C: npx skills update (global + project)
   Task E: Windows Update — scan → install → monitor
 ```
 
@@ -319,7 +326,7 @@ Or (Claude Code):
 Plan: 3 parallel tracks (one UAC prompt via shared elevated session)
   Elevated session: winget (5 packages via Jobs) + Windows Update (serial)
   Task B: npm update -g (parallel, no elevation)
-  Task C: npx skills update -g -y (parallel, no elevation)
+  Task C: npx skills update — global + project (parallel, no elevation)
 ```
 
 ---
@@ -356,7 +363,7 @@ For Tasks B, C: run the single command and capture output.
      - `Wait-Job | Receive-Job` to collect winget results
      - PSWindowsUpdate import, scan, install, reboot check (serial)
    - **Track 2:** `npm update -g 2>&1` (no elevation)
-   - **Track 3:** `npx skills update -g -y 2>&1` (no elevation)
+   - **Track 3:** `npx skills update -g -y 2>&1` then `npx skills update -y 2>&1` (no elevation)
 4. Set timeout for Track 1 to at least 600s (600000ms) — Windows Update can be very slow
 5. Collect and display results from all tracks
 
@@ -401,7 +408,7 @@ Agent:     <agent>
 ── npm update -g ───────────────────────────────────
   [✓] Updated 3 packages
 
-── npx skills update -g -y ─────────────────────────
+── npx skills update ───────────────────────────────
   [✓] All skills up to date
 
 ── apt update ──────────────────────────────────────
@@ -423,6 +430,7 @@ Provide recommendations **ONLY for the detected environment**:
 **Windows:**
 - If winget packages failed, suggest retrying individually: `sudo winget upgrade --id <pkg> --silent --accept-package-agreements --accept-source-agreements --disable-interactivity`
 - If a package failed due to "in use", suggest closing the application first
+- If npm update -g reports `EPERM` errors on `.exe` files (e.g., `workiq.exe`, `azmcp.exe`), this means those packages are currently running. Inform the user: "npm update succeeded but could not replace some executables that are in use. Close the related applications and retry, or ignore — the update itself was applied."
 - If sudo was not in Inline mode, remind: `sudo sudo config --enable normal`
 - If Windows Update requires reboot, inform: "Please restart your computer to complete the update installation. You can do this when convenient."
 - If Windows Update failed to install some updates, suggest: "Try running Windows Update again after a reboot, or check Windows Update settings in Settings → Windows Update"
