@@ -31,6 +31,7 @@ npx skills add chenxizhang/agent-skills --list
 | [cleanup-nul](skills/cleanup-nul) | Find and delete `nul` files accidentally created by tools on Windows |
 | [git-sync-all](skills/git-sync-all) | Recursively find all git repos and pull latest changes **in parallel** |
 | [system-health-check](skills/system-health-check) | Parallel security, performance, and optimization scanning |
+| [update-all](skills/update-all) | Update winget, npm globals, agent skills, and apt **all in parallel** |
 
 All skills are instruction-driven (no scripts), dynamically adapt to your OS/shell, and leverage agent parallelism.
 
