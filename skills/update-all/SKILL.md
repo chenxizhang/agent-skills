@@ -136,23 +136,22 @@ This serial approach allows the agent to:
 - Show the user what's being updated before upgrading
 - Avoid running upgrade with a stale or broken package index
 
-**Task E: Windows Update (Windows only, requires elevation)**
+**Task E: Windows Update (Windows only, requires sudo in Inline mode)**
 
 This task uses PowerShell to trigger, install, and monitor Windows Update. It runs serially internally (scan → download → install → monitor).
+
+⚠️ **All Windows Update commands require elevation.** Use `sudo` to run each command. The same sudo Inline mode check from Phase 1 applies here — if sudo is not available or not in Inline/normal mode, skip this task and inform the user.
 
 **Step 1: Ensure PSWindowsUpdate module is available**
 
 ```powershell
-if (-not (Get-Module -ListAvailable PSWindowsUpdate)) {
-    Install-Module -Name PSWindowsUpdate -Force -Scope CurrentUser
-}
-Import-Module PSWindowsUpdate
+sudo pwsh -NoProfile -Command "if (-not (Get-Module -ListAvailable PSWindowsUpdate)) { Install-Module -Name PSWindowsUpdate -Force }; Import-Module PSWindowsUpdate; Write-Output 'PSWindowsUpdate ready'"
 ```
 
 **Step 2: Scan for available updates**
 
 ```powershell
-$updates = Get-WindowsUpdate
+sudo pwsh -NoProfile -Command "Import-Module PSWindowsUpdate; Get-WindowsUpdate"
 ```
 
 - If no updates found, report "Windows is up to date" and skip remaining steps
@@ -161,7 +160,7 @@ $updates = Get-WindowsUpdate
 **Step 3: Install all updates**
 
 ```powershell
-Install-WindowsUpdate -AcceptAll -AutoReboot:$false -Verbose 2>&1
+sudo pwsh -NoProfile -Command "Import-Module PSWindowsUpdate; Install-WindowsUpdate -AcceptAll -AutoReboot:`$false -Verbose" 2>&1
 ```
 
 - `-AcceptAll`: accept all available updates without prompting
@@ -171,14 +170,14 @@ Install-WindowsUpdate -AcceptAll -AutoReboot:$false -Verbose 2>&1
 **Step 4: Check reboot status**
 
 ```powershell
-Get-WURebootStatus
+sudo pwsh -NoProfile -Command "Import-Module PSWindowsUpdate; Get-WURebootStatus"
 ```
 
 - If reboot is required, clearly inform the user: "⚠️ A restart is required to complete Windows Update installation"
 - Do NOT trigger a reboot automatically
 
 ⚠️ **Important notes for Windows Update:**
-- This task requires **administrator/elevated privileges**. Use `sudo` if available (inline mode), otherwise inform the user that elevation is needed.
+- Every command uses `sudo pwsh -NoProfile -Command "..."` to run in an elevated context — `Get-WindowsUpdate` will NOT return results without elevation
 - Windows Update can take a long time (minutes to hours) — set generous timeouts (initial_wait: 300+ seconds)
 - Some updates may fail if apps are in use — report failures and suggest closing apps
 - Driver updates and feature updates may be included — report what categories are being installed
@@ -225,11 +224,11 @@ For Task D (apt), the execution flow within the sub-agent:
 4. Parse output for summary (X upgraded, Y newly installed, Z held back)
 
 For Task E (Windows Update), the execution flow within the sub-agent:
-1. Ensure PSWindowsUpdate module is available (install if needed)
-2. Run `Get-WindowsUpdate` to scan for available updates
-3. If updates exist, display the list and run `Install-WindowsUpdate -AcceptAll -AutoReboot:$false -Verbose 2>&1`
+1. Ensure PSWindowsUpdate module is available via `sudo pwsh -NoProfile -Command "..."`
+2. Run `sudo pwsh -NoProfile -Command "Import-Module PSWindowsUpdate; Get-WindowsUpdate"` to scan
+3. If updates exist, display the list and run `sudo pwsh -NoProfile -Command "Import-Module PSWindowsUpdate; Install-WindowsUpdate -AcceptAll -AutoReboot:`$false -Verbose"` 
 4. **Use generous timeouts** — Windows Update can be slow. Set `initial_wait: 300` and use `read_powershell` to poll for completion
-5. After installation completes, run `Get-WURebootStatus` to check if reboot is needed
+5. After installation completes, run `sudo pwsh -NoProfile -Command "Import-Module PSWindowsUpdate; Get-WURebootStatus"`
 6. Collect and report results
 
 ---
