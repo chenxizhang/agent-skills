@@ -104,10 +104,48 @@ Based on Phase 1 results, build the task list and parallel strategy.
 1. Run `winget upgrade` (no elevation) to list all upgradable packages
 2. Parse the output to extract package IDs
 3. If no packages to upgrade, skip
-4. For EACH package, run in parallel: `sudo winget upgrade --id <package-id> --silent --accept-package-agreements --accept-source-agreements`
+4. Upgrade all packages **in parallel** — strategy depends on agent (see below)
 5. Collect results per package
 
-⚠️ **Internal parallelism is CRITICAL**: each package upgrade is independent — run them ALL in parallel using agent's parallel tool calls, not sequentially.
+⚠️ **Internal parallelism is CRITICAL**: each package upgrade is independent — run them ALL in parallel, not sequentially.
+
+**Agent-specific sudo strategy for winget:**
+
+Windows sudo caches credentials **per console session**. Agents that reuse the same shell session only get one UAC prompt; agents that spawn new processes per command get prompted every time.
+
+| Agent | Shell Model | sudo Behavior | Strategy |
+|-------|-------------|---------------|----------|
+| **GitHub Copilot CLI** | Persistent shell session | ✅ Cached — one UAC prompt | Use parallel tool calls: each `sudo winget upgrade --id <pkg> ...` as a separate parallel call |
+| **Claude Code** | New process per command | ❌ Not cached — UAC per call | Use **one elevated session + PowerShell Jobs** (see below) |
+| **Other agents** | Check behavior | Test with two `sudo` calls | Pick matching strategy |
+
+**Strategy for GitHub Copilot CLI (parallel tool calls):**
+
+Each package as a parallel tool call — sudo credential is cached in the shared session:
+```
+parallel:
+  sudo winget upgrade --id <pkg1> --silent --accept-package-agreements --accept-source-agreements
+  sudo winget upgrade --id <pkg2> --silent --accept-package-agreements --accept-source-agreements
+  sudo winget upgrade --id <pkg3> --silent --accept-package-agreements --accept-source-agreements
+```
+
+**Strategy for Claude Code (one elevated session + PowerShell Jobs):**
+
+Open ONE `sudo pwsh` session (one UAC prompt), then use PowerShell background jobs for parallelism:
+```powershell
+# Inside the elevated session:
+$packages = @("<pkg1>", "<pkg2>", "<pkg3>")
+$jobs = $packages | ForEach-Object {
+    Start-Job -ScriptBlock {
+        param($id)
+        winget upgrade --id $id --silent --accept-package-agreements --accept-source-agreements 2>&1
+    } -ArgumentList $_
+}
+$jobs | Wait-Job | Receive-Job
+$jobs | Remove-Job
+```
+
+This achieves parallelism within a single elevated session — one UAC prompt, all packages upgrade concurrently.
 
 **Task B: npm update -g (if Node.js installed)**
 
@@ -138,9 +176,9 @@ This serial approach allows the agent to:
 
 **Task E: Windows Update (Windows only, requires sudo in Inline mode)**
 
-This task uses PSWindowsUpdate to scan, install, and monitor Windows Update. To avoid repeated UAC prompts, it uses a **single elevated interactive PowerShell session** — one `sudo` call, then send commands step by step via `write_powershell`.
+This task uses PSWindowsUpdate to scan, install, and monitor Windows Update. It uses a **single elevated interactive PowerShell session** — one `sudo` call, then send commands step by step via `write_powershell`. This pattern works for ALL agents (no credential caching issues).
 
-⚠️ **Do NOT use multiple separate `sudo pwsh -Command "..."` calls** — Windows sudo does NOT cache credentials across separate process invocations, so each one triggers a new UAC prompt.
+⚠️ **Do NOT use multiple separate `sudo pwsh -Command "..."` calls** — Windows sudo does NOT cache credentials across separate process invocations (see agent-specific notes in Task A), so each one triggers a new UAC prompt.
 
 **Execution pattern: single elevated async session**
 
