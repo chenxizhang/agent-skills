@@ -5,10 +5,20 @@ Cross-platform agent skills following the [skills.sh](https://skills.sh/) open e
 ## Install
 
 ```bash
-# Install individual skills
-npx skills add chenxizhang/agent-skills/cleanup-nul
-npx skills add chenxizhang/agent-skills/git-sync-all
-npx skills add chenxizhang/agent-skills/system-health-check
+# Install all skills
+npx skills add chenxizhang/agent-skills --all
+
+# Install a specific skill
+npx skills add chenxizhang/agent-skills --skill cleanup-nul
+
+# Install to specific agents
+npx skills add chenxizhang/agent-skills --agent claude-code copilot
+
+# Install globally (user-level)
+npx skills add chenxizhang/agent-skills -g --all
+
+# List available skills without installing
+npx skills add chenxizhang/agent-skills --list
 ```
 
 ## Available Skills
